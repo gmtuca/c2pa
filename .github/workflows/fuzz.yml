@@ -1,0 +1,34 @@
+name: Fuzz
+
+# Native Go fuzzing — discovers panics and timeouts in the JUMBF / COSE /
+# RFC 3161 parsers by mutating seed corpora. Regular CI runs each target's
+# seed corpus on every push; this workflow is the proactive nightly bug-hunt.
+# Crashes land in testdata/fuzz/<FuzzName>/<hash> — commit them as regressions.
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Duration per target (e.g. 60s, 5m, 30m)"
+        default: "5m"
+        required: false
+
+jobs:
+  fuzz:
+    name: ${{ matrix.func }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        func: [FuzzRead, FuzzWalkBoxes, FuzzRFC3161GenTime]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+          cache: true
+      - name: Fuzz ${{ matrix.func }}
+        run: go test -run='^$' -fuzz="^${{ matrix.func }}$" -fuzztime=${{ github.event.inputs.fuzztime || '5m' }} .
