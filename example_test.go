@@ -31,3 +31,25 @@ func Example() {
 	// ai-generated: false
 	// signed by: C2PA Signer
 }
+
+// ExampleValidate verifies a JPEG's Content Credentials against the embedded
+// C2PA trust list. The test fixture is signed by the c2pa-rs *test* PKI, so its
+// signature verifies cryptographically but its signer does not chain to a
+// production trust anchor — an honest "valid signature, untrusted signer"
+// verdict. Pass WithSigningTrust / WithTimestampTrust to supply your own anchors.
+func ExampleValidate() {
+	f, err := os.Open("testdata/c2pa_signed.jpg")
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	r := c2pa.Validate(context.Background(), c2pa.JPEG, f)
+	fmt.Println("valid:", r.Valid)
+	fmt.Println("signature verified:", r.Has(c2pa.StatusClaimSignatureValidated))
+	fmt.Println("signer trusted:", r.Has(c2pa.StatusSigningCredentialTrusted))
+	// Output:
+	// valid: false
+	// signature verified: true
+	// signer trusted: false
+}

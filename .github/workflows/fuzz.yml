@@ -23,7 +23,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        func: [FuzzRead, FuzzWalkBoxes, FuzzRFC3161GenTime]
+        func:
+          - FuzzRead
+          - FuzzWalkBoxes
+          - FuzzRFC3161GenTime
+          - FuzzWalkBoxesRanges
+          - FuzzValidate
+          - FuzzVerifyDataHash
+          - FuzzVerifyTimestamp
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
