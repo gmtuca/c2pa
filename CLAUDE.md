@@ -40,7 +40,7 @@ go vet ./...
 golangci-lint run
 ```
 
-CI (`.github/workflows/ci.yml`) runs build + vet + race tests on Go `1.23` and `stable` plus
+CI (`.github/workflows/ci.yml`) runs build + vet + race tests on Go `1.25` and `stable` plus
 golangci-lint. `.github/workflows/fuzz.yml` mutates the fuzz targets nightly.
 
 ## Read vs Validate — keep them honest and separate
@@ -61,8 +61,10 @@ fuzz targets stay untouched.
 
 ## Things to know before editing
 
-- **Go 1.23 is the floor.** The code uses `reflect.TypeFor` (Go 1.22+). Don't raise the floor
-  without updating both `go.mod` and the CI matrix's lower bound.
+- **Go 1.25 is the floor**, set by `golang.org/x/crypto`'s own `go` directive (pulled in for OCSP).
+  Use the normal `go mod tidy` workflow; if it raises the floor again, bump the CI matrix's lower
+  bound in `.github/workflows/ci.yml` to match `go.mod` in the same change. (The code itself only
+  needs Go 1.22+ — `reflect.TypeFor` — so the floor is dependency-driven, not language-driven.)
 - **CBOR maps must decode to `map[string]any`.** `decMode` configures fxamacker/cbor with
   `DefaultMapType: map[string]any` — otherwise nested maps come back as `map[any]any` and every
   text-key lookup (`claim["dc:title"]`, etc.) silently misses. This was the original integration bug.
