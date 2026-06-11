@@ -3,8 +3,13 @@ package c2pa
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/sha256"
+	"encoding/binary"
 	"os"
 	"testing"
+
+	cose "github.com/veraison/go-cose"
 )
 
 // FuzzRead targets the full extraction pipeline: jpegJUMBF (APP11
@@ -72,6 +77,117 @@ func FuzzWalkBoxes(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		WalkBoxes(context.Background(), data, func(string, string, []byte) {})
+	})
+}
+
+// FuzzWalkBoxesRanges targets the offset-aware box-tree builder (parseBoxTree)
+// and the manifest-store resolver (parseStore). Unlike WalkBoxes it threads
+// absolute offsets through recursion and slices the original buffer by them, so
+// it is the new spot for off-by-one / out-of-range arithmetic on adversarial
+// LBox fields and nesting.
+//
+// Contract: never panic, never loop forever.
+func FuzzWalkBoxesRanges(f *testing.F) {
+	f.Add([]byte{})
+	// A `jumb` superbox holding a valid `jumd` description box plus one empty
+	// `cbor` child — the minimal shape parseStore navigates.
+	f.Add([]byte{
+		0x00, 0x00, 0x00, 0x2A, 'j', 'u', 'm', 'b', // jumb, lbox 42
+		0x00, 0x00, 0x00, 0x19, 'j', 'u', 'm', 'd', // jumd, lbox 25
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // type UUID
+		0x00,                                            // toggles (no label)
+		0x00, 0x00, 0x00, 0x09, 'c', 'b', 'o', 'r', 0xA0, // cbor child {}
+	})
+	// LBox larger than the buffer — must bail without indexing OOB.
+	f.Add([]byte{0x00, 0x00, 0xFF, 0xFF, 'j', 'u', 'm', 'b'})
+	if b, err := os.ReadFile("testdata/c2pa_signed.jpg"); err == nil {
+		f.Add(b)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_ = parseBoxTree(context.Background(), data)
+		_ = parseStore(context.Background(), data)
+	})
+}
+
+// FuzzValidate targets the full validation pipeline over arbitrary bytes.
+// Online revocation is off by default, keeping the run hermetic (no network).
+//
+// Contract: never panic, never loop forever; garbage yields Valid=false.
+func FuzzValidate(f *testing.F) {
+	f.Add([]byte{})
+	if b, err := os.ReadFile("testdata/c2pa_signed.jpg"); err == nil {
+		f.Add(b)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_ = Validate(context.Background(), JPEG, bytes.NewReader(data))
+		_ = Validate(context.Background(), PNG, bytes.NewReader(data))
+	})
+}
+
+// FuzzVerifyDataHash targets the c2pa.hash.data exclusion-range arithmetic:
+// validating attacker-controlled {start,length} ranges against the asset length
+// and hashing across the gaps. This is the classic spot for integer overflow,
+// overlapping/out-of-order ranges, and out-of-bounds slice panics.
+//
+// Contract: never panic. Ranges deemed valid must produce a sound hash walk.
+func FuzzVerifyDataHash(f *testing.F) {
+	f.Add([]byte{0, 0, 0, 0, 0, 0, 0, 0}, 64)
+	f.Add([]byte{0x00, 0x00, 0x00, 0x14, 0x00, 0x01, 0xCA, 0x59}, 166864)
+	f.Fuzz(func(t *testing.T, raw []byte, n int) {
+		if n < 0 || n > 1<<20 {
+			return
+		}
+		data := make([]byte, n)
+		var list []any
+		for i := 0; i+8 <= len(raw); i += 8 {
+			start := int64(binary.BigEndian.Uint32(raw[i : i+4]))
+			length := int64(binary.BigEndian.Uint32(raw[i+4 : i+8]))
+			list = append(list, map[string]any{"start": start, "length": length})
+		}
+		ranges, ok := exclusionRanges(list, len(data))
+		if !ok {
+			return
+		}
+		h := sha256.New()
+		hashWithExclusions(data, h, ranges)
+		_ = h.Sum(nil)
+	})
+}
+
+// FuzzVerifyTimestamp targets the CMS SignedData descent that verifies an
+// RFC 3161 timestamp token: parsing the SignedData, TSTInfo, and SignerInfo,
+// finding the signer, and checking the signed attributes — all over
+// attacker-controlled DER. This is where the extended ASN.1 descent (beyond
+// rfc3161GenTime's genTime-only walk) must stay panic-free.
+//
+// Contract: never panic, never loop forever.
+func FuzzVerifyTimestamp(f *testing.F) {
+	f.Add([]byte{})
+	// Seed with the real token extracted from the fixture.
+	if b, err := os.ReadFile("testdata/c2pa_signed.jpg"); err == nil {
+		jumbf := extractJUMBF(context.Background(), JPEG, b)
+		if m := parseStore(context.Background(), jumbf).active(); m != nil {
+			var msg cose.Sign1Message
+			if msg.UnmarshalCBOR(m.signature) == nil {
+				if der, _ := extractTSToken(msg.Headers.Unprotected); len(der) > 0 {
+					f.Add(der)
+				}
+			}
+		}
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		sd, ok := parseCMSSignedData(data)
+		if !ok {
+			return
+		}
+		_, _ = parseTSTInfo(sd.eContent)
+		si, ok := parseSignerInfo(sd.signerInfos)
+		if !ok {
+			return
+		}
+		_ = findSigner(sd.certs, si)
+		_, _ = checkSignedAttrs(si.signedAttrs.Bytes, crypto.SHA256, sd.eContent)
 	})
 }
 
