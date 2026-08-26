@@ -31,3 +31,31 @@ dual license):
 
 No pre-signed HEIC fixture exists upstream; HEIC-specific parsing (the `meta`
 FullBox container) is covered by synthetic fixtures in `bmff_test.go`.
+
+## c2pa_2x_openai.png
+
+An OpenAI-generated PNG, contributed by this repository's contributor under the
+repository's MIT licence. It is the C2PA 2.x counterpart to `c2pa_signed.jpg`
+and the only fixture here that exercises the 2.x shapes, all of which the 1.x
+fixture lacks:
+
+- a `c2pa.claim.v2` whose `claim_generator_info` is a **single entry** rather
+  than an array, and which carries no flat `claim_generator`
+  (`OpenAI Media Service API`)
+- a `c2pa.actions.v2` naming a `softwareAgent` of `gpt-image` version `2.0`,
+  with a `trainedAlgorithmicMedia` digital source type
+- an RFC 3161 timestamp held as a **bare CMS `ContentInfo`** in the COSE
+  `sigTst2` unprotected header — there is no `sigTst` at all
+
+Signer `OpenAI Media Service` / `OpenAI OpCo, LLC`, chaining through
+`SSL.com C2PA ICA R1 2025` to `SSL.com C2PA RSA Root CA 2025` (both in the
+embedded signing trust list). Claim title `image.png`, no `dc:format`.
+
+The timestamp is signed by OpenAI's own private TSA (`OpenAI TSA Leaf` →
+`OpenAI TSA Issuing CA` → self-signed `OpenAI TSA Root CA`), which is in no
+C2PA TSA trust list, so it verifies as `timeStamp.untrusted` rather than
+`timeStamp.validated`. That is the correct outcome, not a gap: tests here assert
+the token *parses and binds*, never that it is trusted.
+
+The signing leaf expires 2027-04-23, so tests pin the clock to the signing time
+rather than depending on when they run.

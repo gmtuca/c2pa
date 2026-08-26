@@ -30,6 +30,7 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"io"
+	"math"
 	"math/big"
 	"reflect"
 	"strings"
@@ -77,6 +78,11 @@ type Info struct {
 	// digitalSourceType of trainedAlgorithmicMedia or
 	// compositeWithTrainedAlgorithmicMedia.
 	AIGenerated bool
+	// SoftwareAgent is the tool the first c2pa.actions action that names one
+	// says performed it, as "name/version" (e.g. "gpt-image/2.0"). It is the
+	// model or application, where ClaimGenerator is the signing service.
+	// Empty when no action names one. UNVERIFIED, like every Read field.
+	SoftwareAgent string
 	// SignedBy is the COSE_Sign1 signer's leaf x509 certificate common name
 	// (Subject CN, falling back to the first Organization). UNVERIFIED — the
 	// certificate chain is not validated against the C2PA trust list.
@@ -222,8 +228,15 @@ func parseManifest(ctx context.Context, jumbf []byte) Info {
 		case strings.HasSuffix(label, "c2pa.actions") || strings.Contains(label, "c2pa.actions.v"):
 			info.Present = true
 			var act map[string]any
-			if decMode.Unmarshal(content, &act) == nil && actionsAreAI(act) {
-				info.AIGenerated = true
+			if decMode.Unmarshal(content, &act) == nil {
+				if actionsAreAI(act) {
+					info.AIGenerated = true
+				}
+				// Assigned unconditionally, as ClaimGenerator is: a store holds
+				// an actions box per manifest, and keeping the first non-empty
+				// one would let an ingredient's agent stand beside the active
+				// manifest's generator.
+				info.SoftwareAgent = actionsSoftwareAgent(act)
 			}
 		case strings.HasSuffix(label, "c2pa.signature"):
 			// The signature box content is a COSE_Sign1 (a raw CBOR array,
@@ -298,28 +311,33 @@ func firstX5ChainDER(v any) []byte {
 }
 
 // signingTime extracts the signing time from the COSE unprotected `sigTst`
-// header — a C2PA timestamp container holding RFC 3161 timestamp tokens.
-// Returns the zero time if absent or unparseable.
+// (C2PA 1.x) or `sigTst2` (2.x) header, each a timestamp container holding RFC
+// 3161 tokens. Returns the zero time if absent or unparseable.
+//
+// Both headers must be read: a c2pa.claim.v2 signature carries its timestamp in
+// sigTst2, so looking only at sigTst leaves SignedAt zero for every 2.x file.
 func signingTime(unprotected map[any]any) time.Time {
-	tst, ok := unprotected["sigTst"].(map[any]any)
-	if !ok {
-		return time.Time{}
-	}
-	tokens, ok := tst["tstTokens"].([]any)
-	if !ok {
-		return time.Time{}
-	}
-	for _, tk := range tokens {
-		m, ok := tk.(map[any]any)
+	for _, name := range []string{"sigTst", "sigTst2"} {
+		tst, ok := unprotected[name].(map[any]any)
 		if !ok {
 			continue
 		}
-		der, ok := m["val"].([]byte)
+		tokens, ok := tst["tstTokens"].([]any)
 		if !ok {
 			continue
 		}
-		if t := rfc3161GenTime(der); !t.IsZero() {
-			return t
+		for _, tk := range tokens {
+			m, ok := tk.(map[any]any)
+			if !ok {
+				continue
+			}
+			der, ok := m["val"].([]byte)
+			if !ok {
+				continue
+			}
+			if t := rfc3161GenTime(der); !t.IsZero() {
+				return t
+			}
 		}
 	}
 	return time.Time{}
@@ -329,17 +347,7 @@ func signingTime(unprotected map[any]any) time.Time {
 // SignedData, or a bare ContentInfo) down to TSTInfo.genTime. It is defensive
 // — any structural surprise returns the zero time rather than erroring.
 func rfc3161GenTime(der []byte) time.Time {
-	contentInfo := der
-	// TimeStampResp ::= SEQUENCE { status PKIStatusInfo, timeStampToken ContentInfo OPTIONAL }
-	// When the optional token is present, descend into it; otherwise `der`
-	// is already a bare ContentInfo.
-	var resp struct {
-		Status asn1.RawValue
-		Token  asn1.RawValue `asn1:"optional"`
-	}
-	if _, err := asn1.Unmarshal(der, &resp); err == nil && len(resp.Token.FullBytes) > 0 {
-		contentInfo = resp.Token.FullBytes
-	}
+	contentInfo := timestampContentInfo(der)
 
 	// ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT ANY }
 	var ci struct {
@@ -456,31 +464,46 @@ func jumdLabel(content []byte) (label string, rest []byte) {
 }
 
 // claimGenerator returns the claim's generator string, preferring the flat
-// `claim_generator` field and falling back to claim_generator_info[].
+// `claim_generator` field and falling back to claim_generator_info.
+//
+// claim_generator_info is an array of entries in C2PA 1.x and a single entry in
+// 2.x, so a c2pa.claim.v2 written by Google or OpenAI has no array to read and
+// reading only the array shape leaves the generator empty for every such file.
 func claimGenerator(claim map[string]any) string {
 	if s, ok := claim["claim_generator"].(string); ok && s != "" {
 		return s
 	}
-	infos, ok := claim["claim_generator_info"].([]any)
-	if !ok {
+	switch info := claim["claim_generator_info"].(type) {
+	case map[string]any:
+		return generatorInfoName(info)
+	case []any:
+		var parts []string
+		for _, e := range info {
+			m, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name := generatorInfoName(m); name != "" {
+				parts = append(parts, name)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
 		return ""
 	}
-	var parts []string
-	for _, e := range infos {
-		m, ok := e.(map[string]any)
-		if !ok {
-			continue
-		}
-		name, _ := m["name"].(string)
-		if name == "" {
-			continue
-		}
-		if ver, ok := m["version"].(string); ok && ver != "" {
-			name += "/" + ver
-		}
-		parts = append(parts, name)
+}
+
+// generatorInfoName renders one claim_generator_info entry as "name/version",
+// or as the bare name when it carries no version.
+func generatorInfoName(entry map[string]any) string {
+	name, _ := entry["name"].(string)
+	if name == "" {
+		return ""
 	}
-	return strings.Join(parts, " ")
+	if ver, ok := entry["version"].(string); ok && ver != "" {
+		return name + "/" + ver
+	}
+	return name
 }
 
 // actionsAreAI reports whether a c2pa.actions assertion declares AI-generated
@@ -507,6 +530,76 @@ func actionsAreAI(actAssertion map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// actionsSoftwareAgent returns the softwareAgent of the first action that names
+// one, rendered as "name/version". C2PA 1.x writes it as a plain string on the
+// action and 2.x as an entry, either inline or as a softwareAgentIndex into the
+// assertion's softwareAgents array, so all three shapes are read.
+func actionsSoftwareAgent(actAssertion map[string]any) string {
+	actions, ok := actAssertion["actions"].([]any)
+	if !ok {
+		return ""
+	}
+	for _, a := range actions {
+		m, ok := a.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch agent := m["softwareAgent"].(type) {
+		case string:
+			if agent != "" {
+				return agent
+			}
+		case map[string]any:
+			if name := generatorInfoName(agent); name != "" {
+				return name
+			}
+		}
+		if name := indexedSoftwareAgent(actAssertion, m["softwareAgentIndex"]); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// indexedSoftwareAgent resolves an action's softwareAgentIndex against the
+// assertion's softwareAgents array, the deduplicated form C2PA 2.x uses when
+// several actions share one agent.
+func indexedSoftwareAgent(actAssertion map[string]any, index any) string {
+	i, ok := asIndex(index)
+	if !ok {
+		return ""
+	}
+	agents, ok := actAssertion["softwareAgents"].([]any)
+	if !ok || i >= len(agents) {
+		return ""
+	}
+	entry, ok := agents[i].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return generatorInfoName(entry)
+}
+
+// asIndex reads a non-negative array index from the CBOR decoder's integer
+// forms, which vary with the encoded value's sign and width.
+func asIndex(v any) (int, bool) {
+	switch n := v.(type) {
+	case uint64:
+		if n <= math.MaxInt32 {
+			return int(n), true
+		}
+	case int64:
+		if n >= 0 && n <= math.MaxInt32 {
+			return int(n), true
+		}
+	case int:
+		if n >= 0 {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 func isAIDigitalSourceType(v any) bool {

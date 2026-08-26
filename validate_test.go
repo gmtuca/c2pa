@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/asn1"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	cose "github.com/veraison/go-cose"
 )
 
@@ -161,6 +163,172 @@ func TestValidate_Timestamp(t *testing.T) {
 	}
 	if !r.Valid {
 		t.Errorf("expected Valid=true; first failure=%+v", r.FirstFailure())
+	}
+}
+
+// TestTimestampBareContentInfo checks the token shape C2PA actually writes. The
+// fixture's sigTst holds a full TimeStampResp, but sigTst/sigTst2 may hold the
+// bare ContentInfo inside it, which is what Google's and OpenAI's images carry.
+// Unwrapping the fixture's own token yields that shape, so both can be put
+// through the same verification.
+func TestTimestampBareContentInfo(t *testing.T) {
+	wrapped, tbs := fixtureTSToken(t)
+
+	var resp struct {
+		Status asn1.RawValue
+		Token  asn1.RawValue `asn1:"optional"`
+	}
+	if _, err := asn1.Unmarshal(wrapped, &resp); err != nil {
+		t.Fatalf("fixture token is not a TimeStampResp: %v", err)
+	}
+	// The probe above matches any two-element SEQUENCE, a bare ContentInfo
+	// included, so an OID first element means the fixture is already the shape
+	// this test means to derive and Token is really the [0] content wrapper.
+	var contentType asn1.ObjectIdentifier
+	if _, err := asn1.Unmarshal(resp.Status.FullBytes, &contentType); err == nil {
+		t.Fatal("fixture token is a bare ContentInfo, not a TimeStampResp to unwrap")
+	}
+	bare := resp.Token.FullBytes
+	if len(bare) == 0 {
+		t.Fatal("fixture token carries no timeStampToken")
+	}
+
+	// Read's descent must reach the same genTime for either shape.
+	want := rfc3161GenTime(wrapped)
+	if want.IsZero() {
+		t.Fatal("rfc3161GenTime failed on the wrapped token")
+	}
+	if got := rfc3161GenTime(bare); !got.Equal(want) {
+		t.Errorf("rfc3161GenTime(bare)=%s want %s", got, want)
+	}
+
+	// Validate's must fully verify either shape — messageImprint, CMS signature,
+	// signed attributes and TSA chain — not merely parse it.
+	tsaPool := fixtureTimestampPool(t)
+	for _, tc := range []struct {
+		name string
+		der  []byte
+	}{{"TimeStampResp", wrapped}, {"bare ContentInfo", bare}} {
+		v := &validator{ctx: context.Background(), cfg: validateConfig{timestampTrust: tsaPool}}
+		gt, code := v.verifyTimestampToken(tc.der, tbs, "self#jumbf=/c2pa")
+		if code != StatusTimeStampValidated {
+			t.Errorf("%s: code=%v want %v; statuses=%v", tc.name, code, StatusTimeStampValidated, v.res.Statuses)
+			continue
+		}
+		if !gt.Equal(want) {
+			t.Errorf("%s: genTime=%s want %s", tc.name, gt, want)
+		}
+	}
+}
+
+// fixtureTSToken returns the raw RFC 3161 token embedded in the fixture's COSE
+// signature, and the bytes that token counter-signs.
+func fixtureTSToken(t *testing.T) (der, tbs []byte) {
+	t.Helper()
+	data, err := os.ReadFile("testdata/c2pa_signed.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jumbf := extractJUMBF(context.Background(), JPEG, data)
+	m := parseStore(context.Background(), jumbf).active()
+	if m == nil {
+		t.Fatal("fixture has no manifest")
+	}
+	var msg cose.Sign1Message
+	if err := msg.UnmarshalCBOR(m.signature); err != nil {
+		t.Fatal(err)
+	}
+	der, v2 := extractTSToken(msg.Headers.Unprotected)
+	if len(der) == 0 {
+		t.Fatal("fixture has no timestamp token")
+	}
+	protected, signature, ok := coseParts(m.signature)
+	if !ok {
+		t.Fatal("could not decode the fixture's COSE structure")
+	}
+	counterPayload := m.claimBytes
+	if v2 {
+		counterPayload, _ = cbor.Marshal(signature)
+	}
+	return der, coseCountersignData(counterPayload, protected)
+}
+
+// TestSigningTimeBothTimestampHeaders checks Read reaches the timestamp in
+// either container. C2PA 1.x puts it in sigTst; a c2pa.claim.v2 signature puts
+// it in sigTst2, which is what Google's and OpenAI's images carry, so reading
+// only sigTst leaves Info.SignedAt zero for every 2.x file.
+func TestSigningTimeBothTimestampHeaders(t *testing.T) {
+	der, _ := fixtureTSToken(t)
+	want := rfc3161GenTime(der)
+	if want.IsZero() {
+		t.Fatal("fixture token has no genTime")
+	}
+	for _, name := range []string{"sigTst", "sigTst2"} {
+		unprotected := map[any]any{
+			name: map[any]any{"tstTokens": []any{map[any]any{"val": der}}},
+		}
+		if got := signingTime(unprotected); !got.Equal(want) {
+			t.Errorf("signingTime(%s)=%s want %s", name, got, want)
+		}
+	}
+}
+
+// TestC2PA2xOpenAIFixture puts all three fixes on a real C2PA 2.x file, which
+// no synthesised test can do: a single-entry claim_generator_info, a
+// softwareAgent naming the model, and a bare ContentInfo timestamp that lives in
+// sigTst2 with no sigTst present at all.
+func TestC2PA2xOpenAIFixture(t *testing.T) {
+	data, err := os.ReadFile("testdata/c2pa_2x_openai.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedAt := time.Date(2026, 8, 26, 10, 48, 55, 837381000, time.UTC)
+
+	info := Read(context.Background(), PNG, bytes.NewReader(data))
+	for _, tc := range []struct{ name, got, want string }{
+		{"ClaimGenerator", info.ClaimGenerator, "OpenAI Media Service API"},
+		{"SoftwareAgent", info.SoftwareAgent, "gpt-image/2.0"},
+		{"Title", info.Title, "image.png"},
+		{"SignedBy", info.SignedBy, "OpenAI Media Service"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("Read %s=%q want %q", tc.name, tc.got, tc.want)
+		}
+	}
+	if !info.AIGenerated {
+		t.Error("Read AIGenerated=false, want true")
+	}
+	// Zero here before the descent handled a bare ContentInfo, and zero again
+	// while signingTime read only sigTst.
+	if !info.SignedAt.Equal(signedAt) {
+		t.Errorf("Read SignedAt=%s want %s", info.SignedAt, signedAt)
+	}
+
+	// The clock is pinned to the signing time: the leaf expires 2027-04-23, and
+	// the timestamp is untrusted so it cannot pin the window itself.
+	r := Validate(context.Background(), PNG, bytes.NewReader(data),
+		WithClock(func() time.Time { return signedAt }))
+
+	for _, code := range []StatusCode{StatusClaimSignatureValidated, StatusSigningCredentialTrusted} {
+		if !r.Has(code) {
+			t.Errorf("expected %s; statuses=%v", code, codes(r))
+		}
+	}
+	// The manifest still binds these exact bytes.
+	for _, code := range []StatusCode{StatusAssertionDataHashMismatch, StatusHardBindingMissing} {
+		if r.Has(code) {
+			t.Errorf("unexpected %s; statuses=%v", code, codes(r))
+		}
+	}
+	// The fix, on a real file: the token is no longer read as malformed. It
+	// lands on timeStamp.untrusted instead, because OpenAI timestamps with its
+	// own private TSA root, so that is deliberately not asserted here — a trust
+	// list that later carries that root must not fail this test.
+	if r.Has(StatusTimeStampMismatch) {
+		t.Errorf("timestamp still rejected as malformed; first failure=%+v", r.FirstFailure())
+	}
+	if len(r.SignerChain) != 2 {
+		t.Errorf("SignerChain len=%d want 2", len(r.SignerChain))
 	}
 }
 

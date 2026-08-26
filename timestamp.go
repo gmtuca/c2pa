@@ -196,14 +196,7 @@ type cmsSignedData struct {
 // every step.
 func parseCMSSignedData(der []byte) (cmsSignedData, bool) {
 	var out cmsSignedData
-	contentInfo := der
-	var resp struct {
-		Status asn1.RawValue
-		Token  asn1.RawValue `asn1:"optional"`
-	}
-	if _, err := asn1.Unmarshal(der, &resp); err == nil && len(resp.Token.FullBytes) > 0 {
-		contentInfo = resp.Token.FullBytes
-	}
+	contentInfo := timestampContentInfo(der)
 	var ci struct {
 		OID     asn1.ObjectIdentifier
 		Content asn1.RawValue `asn1:"explicit,tag:0"`
@@ -245,6 +238,31 @@ func parseCMSSignedData(der []byte) (cmsSignedData, bool) {
 		}
 	}
 	return out, true
+}
+
+// timestampContentInfo returns the CMS ContentInfo holding the timestamp's
+// SignedData, from either a bare ContentInfo — what C2PA's sigTst/sigTst2 hold
+// — or one wrapped in an RFC 3161 TimeStampResp. Both are two-element
+// SEQUENCEs, so only their first element tells them apart: a ContentInfo's is
+// an OID, a PKIStatusInfo's is a SEQUENCE. Assuming TimeStampResp descends into
+// a bare ContentInfo's [0] wrapper and fails for every C2PA timestamp.
+func timestampContentInfo(der []byte) []byte {
+	var resp struct {
+		Status asn1.RawValue
+		Token  asn1.RawValue `asn1:"optional"`
+	}
+	if _, err := asn1.Unmarshal(der, &resp); err != nil {
+		return der
+	}
+	if len(resp.Token.FullBytes) == 0 {
+		return der
+	}
+	var contentType asn1.ObjectIdentifier
+	if _, err := asn1.Unmarshal(resp.Status.FullBytes, &contentType); err == nil {
+		// The first element is a content type, so this is already a ContentInfo.
+		return der
+	}
+	return resp.Token.FullBytes
 }
 
 // tstInfoFields holds the TSTInfo fields the verifier needs.

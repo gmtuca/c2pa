@@ -23,7 +23,8 @@ that would force exporting internal helpers.
 
 Public surface:
 
-- `Read` / `Info` — fields Present, ClaimGenerator, Title, Format, AIGenerated, SignedBy, SignedAt.
+- `Read` / `Info` — fields Present, ClaimGenerator, Title, Format, AIGenerated, SoftwareAgent,
+  SignedBy, SignedAt.
 - `Validate` / `ValidationResult` / `StatusEntry` / `StatusCode` / `Severity` — the verifier and its
   result. `ValidateOption` (`WithSigningTrust`, `WithTimestampTrust`, `WithOnlineRevocation`,
   `WithClock`, `WithMaxIngredientDepth`, `WithMaxScan`, `WithHTTPClient`).
@@ -81,9 +82,11 @@ fuzz targets stay untouched.
 - **Everything is best-effort and must never panic.** Malformed/truncated/cancelled input returns
   zero values. The RFC 3161 ASN.1 descent (`rfc3161GenTime`) is deliberately defensive at every
   `asn1.Unmarshal` step. This contract is enforced by the fuzz targets — keep them green.
-- **`signedAt` lives in an RFC 3161 timestamp.** `sigTst` (COSE unprotected header) holds
-  `tstTokens[].val`, each a `TimeStampResp` → CMS `SignedData` → `TSTInfo.genTime`. The walk handles
-  both a full `TimeStampResp` and a bare `ContentInfo`.
+- **`signedAt` lives in an RFC 3161 timestamp.** `sigTst` (1.x) and `sigTst2` (2.x), both COSE
+  unprotected headers, hold `tstTokens[].val`, each a `TimeStampResp` → CMS `SignedData` →
+  `TSTInfo.genTime`. The walk handles both a full `TimeStampResp` and a bare `ContentInfo`. **Read
+  both headers**: a `c2pa.claim.v2` signature carries its timestamp only in `sigTst2`, so looking at
+  `sigTst` alone leaves `SignedAt` zero for every 2.x file.
 
 ### Validation-specific gotchas
 

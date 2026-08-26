@@ -41,6 +41,7 @@ fmt.Println(info.ClaimGenerator) // e.g. "Adobe Firefly"
 fmt.Println(info.Title)          // claim dc:title
 fmt.Println(info.Format)         // claim dc:format
 fmt.Println(info.AIGenerated)    // declared AI-generated?
+fmt.Println(info.SoftwareAgent)  // tool that performed the action, e.g. "gpt-image/2.0"
 fmt.Println(info.SignedBy)       // CLAIMED signer cert CN (unverified)
 fmt.Println(info.SignedAt)       // RFC 3161 signing time (unverified)
 ```
@@ -56,6 +57,7 @@ context — a cancelled call surrenders promptly mid-scan.
 | `Title` | claim `dc:title` |
 | `Format` | claim `dc:format` (declared media type) |
 | `AIGenerated` | a `c2pa.actions` `digitalSourceType` declares `trainedAlgorithmicMedia` / `compositeWithTrainedAlgorithmicMedia` |
+| `SoftwareAgent` | the tool the first `c2pa.actions` action names, as `name/version` (e.g. `gpt-image/2.0`) — the model or app, where `ClaimGenerator` is often the signing service |
 | `SignedBy` | COSE signer leaf-cert common name — **unverified** |
 | `SignedAt` | RFC 3161 signing time — **unverified** |
 
