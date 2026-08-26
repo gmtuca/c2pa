@@ -107,6 +107,118 @@ func TestActionsAreAI(t *testing.T) {
 	}
 }
 
+func TestClaimGeneratorInfoShapes(t *testing.T) {
+	// claim_generator_info is an array in C2PA 1.x and a single entry in 2.x. A
+	// c2pa.claim.v2 from Google or OpenAI carries only the 2.x shape and no flat
+	// claim_generator, so reading just the array leaves the generator empty.
+	for _, tc := range []struct {
+		name  string
+		claim map[string]any
+		want  string
+	}{
+		{"flat claim_generator wins", map[string]any{
+			"claim_generator":      "make_test_images/0.33.1 c2pa-rs/0.33.1",
+			"claim_generator_info": map[string]any{"name": "ignored"},
+		}, "make_test_images/0.33.1 c2pa-rs/0.33.1"},
+
+		{"2.x single entry", map[string]any{
+			"claim_generator_info": map[string]any{"name": "OpenAI Media Service API"},
+		}, "OpenAI Media Service API"},
+
+		{"2.x single entry with version", map[string]any{
+			"claim_generator_info": map[string]any{
+				"name": "Google C2PA Core Generator Library", "version": "964701591:964701591"},
+		}, "Google C2PA Core Generator Library/964701591:964701591"},
+
+		{"1.x array", map[string]any{
+			"claim_generator_info": []any{
+				map[string]any{"name": "Firefly", "version": "1.2"},
+				map[string]any{"name": "Photoshop"},
+			},
+		}, "Firefly/1.2 Photoshop"},
+
+		{"entry without a name", map[string]any{
+			"claim_generator_info": map[string]any{"version": "1.0"},
+		}, ""},
+
+		{"absent", map[string]any{}, ""},
+	} {
+		var m map[string]any
+		if err := decMode.Unmarshal(mustCBOR(t, tc.claim), &m); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := claimGenerator(m); got != tc.want {
+			t.Errorf("%s: claimGenerator=%q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestActionsSoftwareAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		act  map[string]any
+		want string
+	}{
+		{"2.x entry with version", map[string]any{"actions": []any{
+			map[string]any{"action": "c2pa.created",
+				"softwareAgent": map[string]any{"name": "gpt-image", "version": "2.0"}},
+		}}, "gpt-image/2.0"},
+
+		{"1.x plain string", map[string]any{"actions": []any{
+			map[string]any{"action": "c2pa.created", "softwareAgent": "Adobe Firefly 1.0"},
+		}}, "Adobe Firefly 1.0"},
+
+		{"first action that names one", map[string]any{"actions": []any{
+			map[string]any{"action": "c2pa.opened"},
+			map[string]any{"action": "c2pa.created",
+				"softwareAgent": map[string]any{"name": "gpt-image", "version": "2.0"}},
+		}}, "gpt-image/2.0"},
+
+		{"2.x softwareAgentIndex", map[string]any{
+			"softwareAgents": []any{
+				map[string]any{"name": "ignored"},
+				map[string]any{"name": "gpt-image", "version": "2.0"},
+			},
+			"actions": []any{
+				map[string]any{"action": "c2pa.created", "softwareAgentIndex": 1},
+			},
+		}, "gpt-image/2.0"},
+
+		{"inline softwareAgent beats the index", map[string]any{
+			"softwareAgents": []any{map[string]any{"name": "indexed"}},
+			"actions": []any{
+				map[string]any{"action": "c2pa.created", "softwareAgentIndex": 0,
+					"softwareAgent": map[string]any{"name": "inline"}},
+			},
+		}, "inline"},
+
+		{"index past the end", map[string]any{
+			"softwareAgents": []any{map[string]any{"name": "gpt-image"}},
+			"actions": []any{
+				map[string]any{"action": "c2pa.created", "softwareAgentIndex": 5},
+			},
+		}, ""},
+
+		{"index with no softwareAgents array", map[string]any{"actions": []any{
+			map[string]any{"action": "c2pa.created", "softwareAgentIndex": 0},
+		}}, ""},
+
+		{"none named", map[string]any{"actions": []any{
+			map[string]any{"action": "c2pa.created"},
+		}}, ""},
+
+		{"no actions", map[string]any{}, ""},
+	} {
+		var m map[string]any
+		if err := decMode.Unmarshal(mustCBOR(t, tc.act), &m); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := actionsSoftwareAgent(m); got != tc.want {
+			t.Errorf("%s: actionsSoftwareAgent=%q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func mustCBOR(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := cbor.Marshal(v)
