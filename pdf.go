@@ -49,11 +49,16 @@ const maxPDFObjects = 1 << 18
 // attach a handful of associated files, one of them the C2PA manifest.
 const maxPDFAssociatedFiles = 64
 
-// maxPDFInflate is the decompression budget for one extraction, shared by every
-// candidate stream, so neither a compression bomb in the /EF stream nor a file
-// full of them can exhaust memory. A manifest store is orders of magnitude
-// smaller than this even with embedded thumbnails.
+// maxPDFInflate bounds the inflated bytes one extraction keeps: the stores and
+// object-stream payloads it goes on to use. A manifest store is orders of
+// magnitude smaller than this even with embedded thumbnails.
 const maxPDFInflate = MaxScan
+
+// maxPDFStreamInflate bounds one stream on its own. The budget above is charged
+// only for inflated bytes that are kept, so a candidate that decodes to
+// something that is not a store cannot spend another candidate's allowance —
+// a single pool the first candidate can drain suppresses every later one.
+const maxPDFStreamInflate = 8 << 20
 
 // maxPDFHeaderSearch bounds the %PDF- header search. Readers tolerate leading
 // junk before the header; requiring it somewhere near the front keeps the
@@ -221,9 +226,13 @@ func (o *pdfObjects) indexObjStm(body []byte) {
 	if len(raw) == 0 || !okN || !okF || n <= 0 || n > maxPDFObjects || first < 0 {
 		return
 	}
-	payload := o.decodeStream(dict, raw)
+	payload, inflated := o.decodeStream(dict, raw)
 	if first > len(payload) {
 		return
+	}
+	if inflated {
+		// The payload is kept: every body indexed below is a slice of it.
+		o.inflate -= len(payload)
 	}
 	nums, offs, p := make([]int, 0, n), make([]int, 0, n), 0
 	for i := 0; i < n; i++ {
@@ -418,9 +427,12 @@ func (o *pdfObjects) streamStore(ctx context.Context, body []byte) []byte {
 	if len(raw) == 0 {
 		return nil
 	}
-	store := o.decodeStream(dict, raw)
+	store, inflated := o.decodeStream(dict, raw)
 	if !looksLikeJUMBF(store, 0, len(store)) {
 		return nil
+	}
+	if inflated {
+		o.inflate -= len(store)
 	}
 	return store[:binary.BigEndian.Uint32(store[:4])]
 }
@@ -472,20 +484,20 @@ func pdfStreamPayload(body []byte) (dict, payload []byte) {
 // unfiltered store and a /FlateDecode one are read. Any other filter is left
 // undecoded: the caller then sees non-JUMBF bytes and reports no manifest
 // rather than guessing.
-func (o *pdfObjects) decodeStream(dict, raw []byte) []byte {
+// inflated reports whether the bytes came out of a decompressor, so the caller
+// can charge the shared budget once it decides to keep them.
+func (o *pdfObjects) decodeStream(dict, raw []byte) (out []byte, inflated bool) {
 	filters := pdfNames(dict, "Filter", 3)
 	if len(filters) > 0 && filters[0] == "Crypt" {
 		filters = filters[1:]
 	}
 	switch {
 	case len(filters) == 0:
-		return raw
+		return raw, false
 	case len(filters) == 1 && (filters[0] == "FlateDecode" || filters[0] == "Fl"):
-		out := pdfInflate(raw, o.inflate)
-		o.inflate -= len(out)
-		return out
+		return pdfInflate(raw, min(o.inflate, maxPDFStreamInflate)), true
 	default:
-		return nil
+		return nil, false
 	}
 }
 

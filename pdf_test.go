@@ -565,6 +565,27 @@ func TestPDFJUMBF_CompressionBomb(t *testing.T) {
 	}
 }
 
+// TestPDFJUMBF_DecoyCannotDrainBudget pins that one decoy stream cannot spend
+// the whole decompression budget and suppress the real manifest behind it.
+// Charging a single shared pool for a candidate that produced no store turns a
+// 16 KiB stream of zeros into a suppression primitive, and the /AF array is
+// attacker-ordered, so the decoy goes first.
+func TestPDFJUMBF_DecoyCannotDrainBudget(t *testing.T) {
+	store := synthJUMB([]byte("manifest store"))
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [100 0 R 3 0 R] >>").
+		obj(100, "<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 101 0 R >> >>").
+		stream(101, pdfEmbeddedFileDict+" /Filter /FlateDecode",
+			zlibBytes(t, make([]byte, maxPDFInflate)), "").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict+" /Filter /FlateDecode", zlibBytes(t, store), "").
+		trailer(1).bytes()
+	t.Logf("whole document is %d bytes", len(doc))
+	if got := pdfJUMBF(context.Background(), doc); !bytes.Equal(got, store) {
+		t.Fatalf("decoy suppressed the real store: got %d bytes, want %d", len(got), len(store))
+	}
+}
+
 // --- end to end --------------------------------------------------------------
 
 // TestReadPDF_RealManifest carries the JPEG fixture's own manifest store in a
