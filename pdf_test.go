@@ -508,6 +508,26 @@ func TestPDFJUMBF_ObjectStreamChain(t *testing.T) {
 	}
 }
 
+// TestPDFJUMBF_SentinelBytesInPayload pins that a store holding the keywords
+// that delimit PDF objects survives. The payload is arbitrary binary — CBOR, a
+// thumbnail — so it can carry `endobj`, and ending the object body at the first
+// one loses the manifest. Signing a document whose title holds those six bytes
+// would otherwise be enough to make it read as unsigned.
+func TestPDFJUMBF_SentinelBytesInPayload(t *testing.T) {
+	ctx := context.Background()
+	for _, sentinel := range []string{"endobj", "endstream", "\nendobj\nendstream\n"} {
+		for _, compress := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%q/compressed=%v", sentinel, compress), func(t *testing.T) {
+				store := synthJUMB([]byte("a title " + sentinel + " and more"))
+				got := pdfJUMBF(ctx, synthPDF(t, store, compress))
+				if !bytes.Equal(got, store) {
+					t.Fatalf("got %d bytes, want %d", len(got), len(store))
+				}
+			})
+		}
+	}
+}
+
 // TestPDFJUMBF_AttachmentManifestIsNotTheDocument pins that the markers alone do
 // not attribute a store to the document. §A.4.3 gives an object-level manifest
 // the identical /AFRelationship, and §A.4.2.1 puts the document-level file

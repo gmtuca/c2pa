@@ -213,9 +213,14 @@ func indexPDFObjects(ctx context.Context, data []byte) *pdfObjects {
 		if !ok {
 			continue
 		}
-		if endobj < i {
-			if e := bytes.Index(data[i:], []byte("endobj")); e >= 0 {
-				endobj = i + e
+		// Search past the stream payload where the dictionary settles its
+		// extent: the store is arbitrary binary, so it can spell `endobj`, and
+		// ending the body there would lose it. from only ever advances, so the
+		// searches stay non-overlapping and the scan stays linear.
+		from := max(i, pdfStreamEnd(data, i))
+		if endobj < from {
+			if e := bytes.Index(data[from:], []byte("endobj")); e >= 0 {
+				endobj = from + e
 			} else {
 				endobj = len(data)
 			}
@@ -292,6 +297,38 @@ func (o *pdfObjects) indexObjStm(body []byte) {
 		o.newest[nums[i]] = len(o.order)
 		o.order = append(o.order, pdfObject{num: nums[i], body: payload[start:end]})
 	}
+}
+
+// pdfStreamEnd returns the offset just past the stream payload of the object
+// whose body starts at i, when the object's own dictionary settles where it
+// ends: a direct /Length that lands on `endstream`. Returns 0 otherwise — an
+// indirect /Length cannot be resolved while the index is still being built, so
+// such an object keeps falling back to the first `endobj`.
+func pdfStreamEnd(data []byte, i int) int {
+	k := bytes.Index(data[i:min(len(data), i+maxPDFDictScan)], []byte("stream"))
+	if k < 0 {
+		return 0
+	}
+	start := i + k
+	if start > 0 && !pdfIsSpace(data[start-1]) && !pdfIsDelim(data[start-1]) {
+		return 0 // part of a longer token, e.g. `endstream`
+	}
+	n, ok := pdfInt(data[i:start], "Length")
+	if !ok || n < 0 {
+		return 0
+	}
+	p := start + len("stream")
+	if p < len(data) && data[p] == '\r' {
+		p++
+	}
+	if p < len(data) && data[p] == '\n' {
+		p++
+	}
+	if p+n < p || p+n > len(data) ||
+		!bytes.HasPrefix(bytes.TrimLeft(data[p+n:], "\x00\t\n\f\r "), []byte("endstream")) {
+		return 0
+	}
+	return p + n
 }
 
 // pdfObjNumber parses the `N G obj` header whose `obj` keyword starts at pos,
