@@ -9,7 +9,7 @@
 
 A small, **pure-Go** (no cgo) library for [C2PA / Content Credentials](https://c2pa.org)
 provenance manifests embedded in **JPEG**, **PNG**, **BMFF** (MP4, MOV, HEIC, HEIF, AVIF),
-**RIFF** (WebP, WAV, AVI), **TIFF** (and DNG) and **PDF** files, with two modes:
+**RIFF** (WebP, WAV, AVI), **TIFF** (and DNG), **GIF**, **MP3**, **SVG** and **PDF** files, with two modes:
 
 - **`Read`** — a fast, *unverified* reader. Surfaces what a file *claims* (creating tool, title,
   format, AI-generated flag, signer identity, signing time) like EXIF or an email `From:` header.
@@ -32,7 +32,7 @@ AI-generated assets") — not for trust decisions.
 f, _ := os.Open("photo.jpg")
 defer f.Close()
 
-info := c2pa.Read(context.Background(), c2pa.JPEG, f) // or c2pa.PNG / c2pa.BMFF / c2pa.RIFF / c2pa.TIFF / c2pa.PDF
+info := c2pa.Read(context.Background(), c2pa.JPEG, f) // or c2pa.PNG / c2pa.BMFF / c2pa.RIFF / c2pa.TIFF / c2pa.GIF / c2pa.MP3 / c2pa.SVG / c2pa.PDF
 if !info.Present {
     return // no Content Credentials embedded
 }
@@ -56,6 +56,12 @@ container; a chunk declaring more bytes than the file holds is refused rather th
 For **TIFF** and **DNG**, the store is IFD tag `0xCD41` with field type UNDEFINED; every IFD in the
 chain is checked, and the chain is hop-capped because a next-IFD offset may point backwards.
 BigTIFF is not read.
+
+For **GIF**, the store is the application extension identified by `C2PA_GIF`, reassembled from its
+data sub-blocks; the block structure is walked rather than scanned, since LZW image data can spell
+the marker. For **MP3**, it is an ID3v2 `GEOB` frame with MIME type `application/c2pa`. For **SVG**,
+it is base64 in a `<c2pa:manifest>` element bound to `http://c2pa.org/manifest`, parsed as XML so a
+match in a comment or CDATA is not mistaken for it.
 
 For **PDF**, the manifest store is the embedded file the document catalog associates with
 `/AFRelationship /C2PA_Manifest` (spec §A.4). The catalog is the one the last `startxref` names, so

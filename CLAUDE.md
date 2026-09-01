@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `github.com/richardwooding/c2pa` is a flat (single Go package, no subpackages) **pure-Go** library
 for C2PA / Content Credentials provenance manifests in JPEG, PNG, BMFF (MP4/MOV/HEIC/HEIF/
-AVIF), RIFF (WebP/WAV/AVI), TIFF (and DNG) and PDF, with **two modes**:
+AVIF), RIFF (WebP/WAV/AVI), TIFF (and DNG), GIF, MP3, SVG and PDF, with **two modes**:
 
 - **`Read(ctx, container, r) Info`** — the fast, *unverified* reader. Surfaces what a file CLAIMS
   (generator, title, signer CN, signing time, AI flag) like EXIF or an unverified `From:` header. It

@@ -34,6 +34,11 @@ jobs:
           - FuzzBMFFParse
           - FuzzBMFFHash
           - FuzzPDFParse
+          - FuzzRIFFParse
+          - FuzzTIFFParse
+          - FuzzGIFParse
+          - FuzzMP3Parse
+          - FuzzSVGParse
           - FuzzCorpusRead
           - FuzzCorpusValidate
           - FuzzCorpusTimestamp

@@ -76,6 +76,15 @@ const (
 	// TIFF reads the manifest from IFD tag 0xCD41 in a TIFF or DNG file. DNG is
 	// TIFF, so one constant covers both. BigTIFF is not read.
 	TIFF Container = "tiff"
+	// GIF reads the manifest from the application extension whose identifier is
+	// "C2PA_GIF", its payload reassembled from the extension's data sub-blocks.
+	GIF Container = "gif"
+	// MP3 reads the manifest from an ID3v2 GEOB frame whose MIME type is
+	// application/c2pa. An unsynchronised tag is not read.
+	MP3 Container = "mp3"
+	// SVG reads the manifest from a base64 <c2pa:manifest> element bound to
+	// http://c2pa.org/manifest. The document is parsed as XML, not scanned.
+	SVG Container = "svg"
 )
 
 // Attribution says what a manifest is a claim about. A container can carry a
@@ -171,6 +180,12 @@ func Read(ctx context.Context, container Container, r io.Reader) Info {
 		jumbf = riffJUMBF(ctx, data)
 	case TIFF:
 		jumbf = tiffJUMBF(ctx, data)
+	case GIF:
+		jumbf = gifJUMBF(ctx, data)
+	case MP3:
+		jumbf = mp3JUMBF(ctx, data)
+	case SVG:
+		jumbf = svgJUMBF(ctx, data)
 	case PDF:
 		var src pdfStoreSource
 		_, jumbf, src = pdfScan(ctx, data)

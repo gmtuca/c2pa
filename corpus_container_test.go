@@ -1,6 +1,7 @@
 package c2pa
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -129,6 +130,49 @@ func assembleAsset(container Container, store []byte) (asset []byte, exclStart, 
 		exclStart = ifd
 		asset = append(asset, store...)
 		exclLen = len(store)
+	case GIF:
+		// GIF89a, no global colour table, then the C2PA application extension.
+		// The exclusion covers the whole extension — introducer through
+		// terminator — since its sub-block framing is part of the inserted bytes.
+		asset = append(asset, "GIF89a"...)
+		asset = append(asset, 1, 0, 1, 0, 0, 0, 0) // logical screen descriptor
+		exclStart = len(asset)
+		asset = append(asset, gifExtensionIntroducer, gifApplicationLabel, byte(len(gifC2PAIdentifier)))
+		asset = append(asset, gifC2PAIdentifier...)
+		asset = append(asset, gifSubBlockChain(store)...)
+		exclLen = len(asset) - exclStart
+		asset = append(asset, gifTrailer)
+	case MP3:
+		// ID3v2.4 tag holding one GEOB frame, then a token frame of audio. The
+		// exclusion covers the store bytes inside the frame body.
+		geob := []byte{0} // ISO-8859-1 text encoding
+		geob = append(geob, id3C2PAMime...)
+		geob = append(geob, 0, 'c', '2', 'p', 'a', 0) // filename
+		geob = append(geob, 0)                        // empty description
+		hdrLen := 10 + 10 + len(geob)
+		tagSize := 10 + len(geob) + len(store)
+		asset = append(asset, "ID3"...)
+		asset = append(asset, 4, 0, 0)
+		asset = append(asset, id3AppendSynchsafe(tagSize)...)
+		asset = append(asset, "GEOB"...)
+		asset = append(asset, id3AppendSynchsafe(len(geob)+len(store))...)
+		asset = append(asset, 0, 0)
+		asset = append(asset, geob...)
+		exclStart = hdrLen
+		asset = append(asset, store...)
+		exclLen = len(store)
+		asset = append(asset, 0xFF, 0xFB, 0x90, 0x00) // a plausible frame header
+	case SVG:
+		// The store is base64 inside <c2pa:manifest>, so the exclusion covers
+		// the encoded text rather than the raw bytes.
+		encoded := base64.StdEncoding.EncodeToString(store)
+		prefix := `<svg xmlns="http://www.w3.org/2000/svg" xmlns:c2pa="` + svgManifestNS +
+			`"><metadata><c2pa:manifest>`
+		asset = append(asset, prefix...)
+		exclStart = len(asset)
+		asset = append(asset, encoded...)
+		exclLen = len(encoded)
+		asset = append(asset, `</c2pa:manifest></metadata><rect width="1" height="1"/></svg>`...)
 	case PDF:
 		// Catalog /AF → file specification → embedded file stream (spec §A.4).
 		// The exclusion covers exactly the stream payload, as Adobe's reference
@@ -261,4 +305,24 @@ func riffChunk(id string, payload []byte) []byte {
 		out = append(out, 0)
 	}
 	return out
+}
+
+// gifSubBlockChain splits payload into GIF data sub-blocks of at most 255
+// bytes, terminated by an empty block.
+func gifSubBlockChain(payload []byte) []byte {
+	var out []byte
+	for len(payload) > 0 {
+		n := min(len(payload), 255)
+		out = append(out, byte(n))
+		out = append(out, payload[:n]...)
+		payload = payload[n:]
+	}
+	return append(out, 0)
+}
+
+// id3AppendSynchsafe encodes n as ID3's 7-bits-per-byte integer.
+func id3AppendSynchsafe(n int) []byte {
+	return []byte{
+		byte(n >> 21 & 0x7F), byte(n >> 14 & 0x7F), byte(n >> 7 & 0x7F), byte(n & 0x7F),
+	}
 }

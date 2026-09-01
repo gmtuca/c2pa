@@ -280,6 +280,12 @@ func extractJUMBF(ctx context.Context, container Container, data []byte) []byte 
 		return riffJUMBF(ctx, data)
 	case TIFF:
 		return tiffJUMBF(ctx, data)
+	case GIF:
+		return gifJUMBF(ctx, data)
+	case MP3:
+		return mp3JUMBF(ctx, data)
+	case SVG:
+		return svgJUMBF(ctx, data)
 	case PDF:
 		return pdfJUMBF(ctx, data)
 	default:
