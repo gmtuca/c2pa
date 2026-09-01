@@ -185,7 +185,7 @@ func pdfObjNumber(data []byte, pos int) (int, bool) {
 // no /Root, or a catalog or file specification compressed into an object
 // stream.
 func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) []byte {
-	root, ok := pdfRootRef(data)
+	root, ok := pdfRootLexical(ctx, data)
 	if !ok {
 		return nil
 	}
@@ -407,23 +407,44 @@ func pdfDrain(r io.Reader, limit int) []byte {
 	return out
 }
 
-// pdfRootRef returns the object number of the document catalog, taken from the
-// last /Root in the file. Both a classic `trailer` dictionary and an xref
-// stream's dictionary spell it out in plain bytes, and an incremental update
-// appends a fresh one, so the final occurrence names the current catalog.
-func pdfRootRef(data []byte) (int, bool) {
-	root, found := 0, false
-	for i := 0; i < len(data); {
-		p := pdfFindName(data, "Root", i)
-		if p < 0 {
-			break
+// pdfRootLexical returns the object number of the document catalog by scanning
+// for /Root. Both a classic `trailer` dictionary and an xref stream's dictionary
+// spell it out in plain bytes, and an incremental update appends a fresh one, so
+// the search runs backwards from the end and takes the first that resolves: the
+// current trailer is at the tail, which makes the common case O(1).
+func pdfRootLexical(ctx context.Context, data []byte) (int, bool) {
+	for i := len(data); i > 0; {
+		if ctx.Err() != nil {
+			return 0, false
 		}
-		i = p
+		p := pdfFindNameBack(data, "Root", i)
+		if p < 0 {
+			return 0, false
+		}
+		i = p - 1
 		if refs := pdfRefList(data[p:], 1); len(refs) == 1 {
-			root, found = refs[0], true
+			return refs[0], true
 		}
 	}
-	return root, found
+	return 0, false
+}
+
+// pdfFindNameBack is pdfFindName in reverse: the offset just past the last name
+// token /key ending at or before limit, or -1.
+func pdfFindNameBack(b []byte, key string, limit int) int {
+	tok := []byte("/" + key)
+	for i := min(limit, len(b)); i >= len(tok); {
+		k := bytes.LastIndex(b[:i], tok)
+		if k < 0 {
+			return -1
+		}
+		e := k + len(tok)
+		if e >= len(b) || pdfIsSpace(b[e]) || pdfIsDelim(b[e]) {
+			return e
+		}
+		i = e - 1
+	}
+	return -1
 }
 
 // pdfDict returns the leading window of an object body that a key lookup reads:
@@ -454,6 +475,18 @@ func pdfFindName(b []byte, key string, from int) int {
 	return -1
 }
 
+// pdfArrayEnd returns where an array opened just before p ends: its `]`, or the
+// window bound when there is none. `[` is a delimiter, so `/Root[` matches the
+// name token and opens an array that may never close; searching the rest of the
+// buffer for the `]` would cost a full scan for every occurrence of the key.
+func pdfArrayEnd(b []byte, p int) int {
+	end := min(len(b), p+maxPDFDictScan)
+	if e := bytes.IndexByte(b[p:end], ']'); e >= 0 {
+		return p + e
+	}
+	return end
+}
+
 // pdfNames reads the value of /key as name objects, accepting both a bare name
 // (/FlateDecode) and an array of them ([/FlateDecode]), with #XX escapes
 // resolved and the leading slash dropped.
@@ -465,9 +498,7 @@ func pdfNames(b []byte, key string, max int) []string {
 	p, end := pdfSkipSpace(b, p), len(b)
 	if p < end && b[p] == '[' {
 		p++
-		if e := bytes.IndexByte(b[p:], ']'); e >= 0 {
-			end = p + e
-		}
+		end = pdfArrayEnd(b, p)
 	} else {
 		max = 1 // a bare value is one name; the next one belongs to another key
 	}
@@ -504,7 +535,9 @@ func pdfText(b []byte, key string) string {
 		return ""
 	}
 	if p = pdfSkipSpace(b, p); p < len(b) && b[p] == '(' {
-		if e := bytes.IndexByte(b[p:], ')'); e > 0 {
+		// Bounded for the same reason as pdfArrayEnd: an unterminated literal
+		// string must not cost a scan of the rest of the buffer.
+		if e := bytes.IndexByte(b[p:min(len(b), p+maxPDFDictScan)], ')'); e > 0 {
 			return string(b[p+1 : p+e])
 		}
 		return ""
@@ -564,9 +597,7 @@ func pdfRefList(b []byte, max int) []int {
 	p, end := pdfSkipSpace(b, 0), len(b)
 	if p < end && b[p] == '[' {
 		p++
-		if e := bytes.IndexByte(b[p:], ']'); e >= 0 {
-			end = p + e
-		}
+		end = pdfArrayEnd(b, p)
 	} else {
 		max = 1 // a bare value is one reference, not the start of a run
 	}

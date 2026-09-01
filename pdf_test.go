@@ -376,6 +376,42 @@ func TestPDFJUMBF_PathologicalCost(t *testing.T) {
 	})
 }
 
+// pdfOpenArrayDoc builds kib kibibytes of a repeated token behind one real
+// object, so the object index is non-empty and /Root resolution actually runs.
+func pdfOpenArrayDoc(kib int, tok string) []byte {
+	doc := append([]byte("%PDF-1.7\n"), "1 0 obj\n<< /Type /Catalog >>\nendobj\n"...)
+	return append(doc, bytes.Repeat([]byte(tok), kib*1024/len(tok))...)
+}
+
+// TestPDFJUMBF_UnterminatedArrayCost pins a ceiling on the `/Root[` shape. `[`
+// is a delimiter, so the name token matches and opens an array; searching for
+// the `]` that never arrives costs the rest of the buffer, once per /Root, over
+// every /Root. The ceilings are wall-clock because the growth rate is the
+// defect: unbounded, 1 MiB cost ~1.5s and Read's cap is 16 MiB of it.
+func TestPDFJUMBF_UnterminatedArrayCost(t *testing.T) {
+	t.Run("bounded array window", func(t *testing.T) {
+		doc := pdfOpenArrayDoc(1024, "/Root[")
+		start := time.Now()
+		if got := pdfJUMBF(context.Background(), doc); got != nil {
+			t.Fatalf("yielded %d bytes", len(got))
+		}
+		if d := time.Since(start); d > 300*time.Millisecond {
+			t.Fatalf("1 MiB of unterminated arrays took %v, want under 300ms", d)
+		}
+	})
+
+	t.Run("deadline honoured", func(t *testing.T) {
+		doc := pdfOpenArrayDoc(1024, "/Root[")
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		pdfJUMBF(ctx, doc)
+		if d := time.Since(start); d > 400*time.Millisecond {
+			t.Fatalf("a 50ms deadline did not stop the scan: took %v", d)
+		}
+	})
+}
+
 // TestPDFJUMBF_CompressionBomb pins that inflation is capped: a stream that
 // expands far past maxPDFInflate returns rather than exhausting memory.
 func TestPDFJUMBF_CompressionBomb(t *testing.T) {
