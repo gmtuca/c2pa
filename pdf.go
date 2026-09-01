@@ -87,15 +87,17 @@ const maxPDFObjectStreams = 16
 
 // pdfObject is one `N G obj … endobj` definition. body is a subslice of the
 // asset bytes running from just past the `obj` keyword to `endobj`, so a
-// stream's payload stays addressable. hdr is where the definition starts; for
-// one recovered from an object stream, stm and idx say which stream held it and
+// stream's payload stays addressable. hdr is where the definition starts and
+// start where its body does, which is what re-cutting a body needs; for one
+// recovered from an object stream, stm and idx say which stream held it and
 // where. A cross-reference entry names one or the other.
 type pdfObject struct {
-	num  int
-	hdr  int
-	stm  int
-	idx  int
-	body []byte
+	num   int
+	hdr   int
+	start int
+	stm   int
+	idx   int
+	body  []byte
 }
 
 // pdfXrefLoc is where a cross-reference section says an object's current
@@ -268,9 +270,64 @@ func indexPDFObjects(ctx context.Context, data []byte) *pdfObjects {
 			}
 		}
 		objs.newest[num] = len(objs.order)
-		objs.order = append(objs.order, pdfObject{num: num, hdr: hdr, body: data[i:endobj]})
+		objs.order = append(objs.order, pdfObject{
+			num: num, hdr: hdr, start: i, body: data[i:endobj],
+		})
 	}
+	objs.repairIndirectLengths(ctx, data)
 	return objs
+}
+
+// repairIndirectLengths re-cuts the stream objects whose extent the forward pass
+// could not settle. An indirect /Length names an object that may be defined
+// later in the file, so it resolves only once the index is complete; until then
+// the object ends at the first `endobj`, and a manifest store is arbitrary
+// binary that can spell one. Runs before any object stream is indexed, so every
+// entry here is a visible definition whose start addresses the asset bytes.
+func (o *pdfObjects) repairIndirectLengths(ctx context.Context, data []byte) {
+	for i := range o.order {
+		if ctx.Err() != nil {
+			return
+		}
+		obj := &o.order[i]
+		start, ok := pdfStreamKeyword(data, obj.start)
+		if !ok {
+			continue
+		}
+		// Only an indirect /Length is unfinished business: a direct one the
+		// forward pass either used or rejected as a lie, and re-deciding it here
+		// would undo that.
+		refs := pdfRefs(data[obj.start:start], "Length", 1)
+		if len(refs) == 0 {
+			continue
+		}
+		n, ok := pdfIntBody(o.body(refs[0]))
+		if !ok {
+			continue
+		}
+		end := pdfStreamExtent(data, start, n)
+		if end <= 0 {
+			continue
+		}
+		obj.body = data[obj.start:pdfEndObj(data, end)]
+	}
+}
+
+// pdfIntBody reads the integer an object body holds on its own, which is what an
+// indirect /Length points at.
+func pdfIntBody(body []byte) (int, bool) {
+	p := pdfSkipSpace(body, 0)
+	n, _, ok := pdfUint(body, p, len(body))
+	return n, ok
+}
+
+// pdfEndObj returns where the `endobj` at or after from starts, or the end of
+// the input when there is none, matching how the forward pass bounds a body.
+func pdfEndObj(data []byte, from int) int {
+	if e := bytes.Index(data[from:], []byte("endobj")); e >= 0 {
+		return from + e
+	}
+	return len(data)
 }
 
 // indexObjectStreams adds the objects held inside every visible /Type /ObjStm.
@@ -299,7 +356,7 @@ func (o *pdfObjects) indexObjectStreams(ctx context.Context) {
 // of object number and offset, each relative to /First, and the bodies follow in
 // the same order, so one pair's offset bounds the body before it.
 func (o *pdfObjects) indexObjStm(stm int, body []byte) {
-	dict, raw := pdfStreamPayload(body)
+	dict, raw := o.streamPayload(body)
 	n, okN := pdfInt(dict, "N")
 	first, okF := pdfInt(dict, "First")
 	if len(raw) == 0 || !okN || !okF || n <= 0 || n > maxPDFObjects || first < 0 {
@@ -357,16 +414,36 @@ func (o *pdfObjects) indexObjStm(stm int, body []byte) {
 // indirect /Length cannot be resolved while the index is still being built, so
 // such an object keeps falling back to the first `endobj`.
 func pdfStreamEnd(data []byte, i int) int {
-	k := bytes.Index(data[i:min(len(data), i+maxPDFDictScan)], []byte("stream"))
-	if k < 0 {
+	start, ok := pdfStreamKeyword(data, i)
+	if !ok {
 		return 0
-	}
-	start := i + k
-	if start > 0 && !pdfIsSpace(data[start-1]) && !pdfIsDelim(data[start-1]) {
-		return 0 // part of a longer token, e.g. `endstream`
 	}
 	n, ok := pdfInt(data[i:start], "Length")
 	if !ok || n < 0 {
+		return 0
+	}
+	return pdfStreamExtent(data, start, n)
+}
+
+// pdfStreamKeyword finds the `stream` keyword opening the body that starts at i,
+// as a whole token so `endstream` cannot pass for one.
+func pdfStreamKeyword(data []byte, i int) (int, bool) {
+	k := bytes.Index(data[i:min(len(data), i+maxPDFDictScan)], []byte("stream"))
+	if k < 0 {
+		return 0, false
+	}
+	start := i + k
+	if start > 0 && !pdfIsSpace(data[start-1]) && !pdfIsDelim(data[start-1]) {
+		return 0, false
+	}
+	return start, true
+}
+
+// pdfStreamExtent returns the offset just past a payload of n bytes opening at
+// the `stream` keyword at start, when n lands on `endstream`. Returns 0 when it
+// does not, so a length that lies never decides where the object ends.
+func pdfStreamExtent(data []byte, start, n int) int {
+	if n < 0 {
 		return 0
 	}
 	p := start + len("stream")
@@ -637,7 +714,7 @@ func (o *pdfObjects) streamStore(ctx context.Context, body []byte) []byte {
 	if ctx.Err() != nil || len(body) == 0 {
 		return nil
 	}
-	dict, raw := pdfStreamPayload(body)
+	dict, raw := o.streamPayload(body)
 	if len(raw) == 0 {
 		return nil
 	}
@@ -651,13 +728,13 @@ func (o *pdfObjects) streamStore(ctx context.Context, body []byte) []byte {
 	return store[:binary.BigEndian.Uint32(store[:4])]
 }
 
-// pdfStreamPayload returns the still-encoded bytes between an object's `stream`
-// keyword and its `endstream`. /Length is a hint, verified before use and never
-// trusted — it may be an indirect reference, and a length that lies must not
-// slice past the object — so the keyword search is what bounds the payload.
-// Trailing bytes are left on: the decoders stop at the end of their own stream,
-// and an uncompressed store is trimmed by its superbox length.
-func pdfStreamPayload(body []byte) (dict, payload []byte) {
+// streamPayload returns the still-encoded bytes between an object's `stream`
+// keyword and its `endstream`. /Length is verified against `endstream` before
+// use, so one that lies cannot slice past the object and the keyword search
+// bounds the payload instead; an indirect one is resolved through the index,
+// which is what reaches a payload whose own bytes spell `endstream`. Trailing
+// bytes are left on: an uncompressed store is trimmed by its superbox length.
+func (o *pdfObjects) streamPayload(body []byte) (dict, payload []byte) {
 	for pos := 0; pos < len(body); {
 		k := bytes.Index(body[pos:], []byte("stream"))
 		if k < 0 {
@@ -681,7 +758,13 @@ func pdfStreamPayload(body []byte) (dict, payload []byte) {
 		if p < len(body) && body[p] == '\n' {
 			p++
 		}
-		if n, ok := pdfInt(dict, "Length"); ok && n >= 0 && p+n <= len(body) &&
+		n, ok := pdfInt(dict, "Length")
+		if !ok {
+			if refs := pdfRefs(dict, "Length", 1); len(refs) == 1 {
+				n, ok = pdfIntBody(o.body(refs[0]))
+			}
+		}
+		if ok && n >= 0 && p+n <= len(body) &&
 			bytes.HasPrefix(bytes.TrimLeft(body[p+n:], "\x00\t\n\f\r "), []byte("endstream")) {
 			return dict, body[p : p+n]
 		}
@@ -862,7 +945,7 @@ func pdfXrefStream(data []byte, p int, objs *pdfObjects, locs map[int]pdfXrefLoc
 	dict := pdfDict(body)
 
 	w := pdfIntList(dict, "W", 3)
-	_, raw := pdfStreamPayload(body)
+	_, raw := objs.streamPayload(body)
 	if len(w) != 3 || len(raw) == 0 {
 		return dict // not a decodable xref stream; the trailer entries still stand
 	}

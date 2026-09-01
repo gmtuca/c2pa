@@ -657,6 +657,31 @@ func TestPDFJUMBF_SentinelBytesInPayload(t *testing.T) {
 	}
 }
 
+// TestPDFJUMBF_IndirectLengthWithSentinelInPayload combines the two things the
+// scanner survives one at a time. An indirect /Length cannot be resolved on the
+// forward pass, so the object falls back to the first `endobj`; a store is
+// arbitrary binary and can spell one. The length object is written after the
+// stream, which is what makes the forward pass unable to see it and what a
+// producer emits.
+func TestPDFJUMBF_IndirectLengthWithSentinelInPayload(t *testing.T) {
+	ctx := context.Background()
+	for _, sentinel := range []string{"endobj", "\nendobj\nendstream\n"} {
+		t.Run(sentinel, func(t *testing.T) {
+			store := synthJUMB([]byte("a title " + sentinel + " and more"))
+			doc := newPDFDoc().
+				obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+				obj(3, pdfC2PAFilespec).
+				stream(4, pdfEmbeddedFileDict, store, "9 0 R").
+				obj(9, fmt.Sprint(len(store))).
+				trailer(1).bytes()
+
+			if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, store) {
+				t.Fatalf("got %d bytes, want %d", len(got), len(store))
+			}
+		})
+	}
+}
+
 // pdfWithAttachmentManifest builds a document whose catalog associates a plain
 // attachment, while a second embedded file carries a C2PA manifest that nothing
 // in the catalog points at — what §A.4.3 describes, and what an attachment
