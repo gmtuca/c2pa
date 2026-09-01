@@ -84,13 +84,17 @@ fuzz targets stay untouched.
   `asn1.Unmarshal` step. This contract is enforced by the fuzz targets — keep them green.
 - **`pdf.go` is a lexical object scanner, not a PDF parser.** The store is an embedded file whose
   file specification carries `/AFRelationship /C2PA_Manifest`, referenced from the catalog's `/AF`
-  (spec §A.4.1/§A.4.2.1). The catalog or the specification can be compressed into an object stream
-  and so be invisible; the stream object never can be (PDF 32000-1 §7.5.7), which is why the
-  fallback scans for the markers directly. `/Length` is a hint, verified against `endstream` and
-  never trusted; inflation is capped by `maxPDFInflate`. Deliberately NOT implemented: merging the
-  stores of every update section into one (§A.4.2.1), which needs revision boundaries the spec
-  never defines. Object-level manifests (§A.4.3) are indistinguishable from document-level ones in
-  the fallback path.
+  (spec §A.4.1/§A.4.2.1). The catalog and the specification can be compressed into an object
+  stream, so the scan inflates visible `/Type /ObjStm` streams and indexes what they hold. PDF
+  32000-1 §7.5.7 forbids a stream object inside an object stream but permits that file
+  specification dictionary, so **the store's bytes being visible does not make the store
+  identifiable** — do not reach for that argument, it is false, and the marker fallback is not a
+  substitute for the chain. The catalog is resolved the way a reader does, through the last
+  `startxref`: taking the last `/Root` in the file lets bytes appended after `%%EOF` redirect the
+  document. `/Length` is a hint, verified against `endstream` and never trusted; inflation is
+  capped by `maxPDFInflate`. Deliberately NOT implemented: merging the stores of every update
+  section into one (§A.4.2.1). Object-level manifests (§A.4.3) are indistinguishable from
+  document-level ones in the fallback path, which is why a fallback-sourced store is reported.
 - **`signedAt` lives in an RFC 3161 timestamp.** `sigTst` (1.x) and `sigTst2` (2.x), both COSE
   unprotected headers, hold `tstTokens[].val`, each a `TimeStampResp` → CMS `SignedData` →
   `TSTInfo.genTime`. The walk handles both a full `TimeStampResp` and a bare `ContentInfo`. **Read

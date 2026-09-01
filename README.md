@@ -51,10 +51,12 @@ fmt.Println(info.SignedAt)       // RFC 3161 signing time (unverified)
 context — a cancelled call surrenders promptly mid-scan.
 
 For **PDF**, the manifest store is the embedded file the document catalog associates with
-`/AFRelationship /C2PA_Manifest` (spec §A.4). An incremental update appends a new store and the
-newest is the active manifest; a `/FlateDecode` stream is inflated under a bound. Stores from
-earlier update sections are surfaced only when the current catalog associates none — they are not
-merged into the active manifest as §A.4.2.1 asks.
+`/AFRelationship /C2PA_Manifest` (spec §A.4). The catalog is the one the last `startxref` names, so
+bytes appended after `%%EOF` cannot redirect the document; a catalog or file specification
+compressed into an object stream is recovered by inflating it, and a `/FlateDecode` stream is
+inflated under a bound. Where only the spec's markers are visible, the store found that way cannot
+be shown to be the document's rather than an attachment's, and `Validate` says so. Stores from
+earlier update sections are not merged into the active manifest as §A.4.2.1 asks.
 
 | `Info` field | Meaning |
 |---|---|

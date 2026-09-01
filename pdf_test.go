@@ -425,6 +425,48 @@ func TestPDFJUMBF_MarkerFallback(t *testing.T) {
 	})
 }
 
+// pdfObjStmDoc hides the pointer chain in an object stream: the catalog and the
+// file specification live inside a /Type /ObjStm, the xref stream's dictionary
+// names /Root, and only the manifest stream is plainly visible. It carries no
+// /Subtype, as the one real producer file available does not.
+func pdfObjStmDoc(t *testing.T, store []byte) []byte {
+	t.Helper()
+	inner := map[int]string{
+		1: "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>",
+		3: "<< /Type /Filespec /F (c2pa.c2pa) /AFRelationship /C2PA_Manifest" +
+			" /EF << /F 4 0 R >> >>",
+	}
+	var hdr, bodies string
+	for _, num := range []int{1, 3} {
+		hdr += fmt.Sprintf("%d %d ", num, len(bodies))
+		bodies += inner[num] + " "
+	}
+
+	d := newPDFDoc()
+	d.stream(5, fmt.Sprintf("/Type /ObjStm /N 2 /First %d /Filter /FlateDecode", len(hdr)),
+		zlibBytes(t, []byte(hdr+bodies)), "")
+	d.stream(4, "/Type /EmbeddedFile", store, "")
+	xref := len(d.bytes())
+	d.stream(6, "/Type /XRef /Size 7 /Root 1 0 R /W [1 2 1]", []byte{0}, "")
+	return d.append(fmt.Sprintf("startxref\n%d\n%%%%EOF\n", xref)).bytes()
+}
+
+// TestPDFJUMBF_ObjectStreamChain pins that a chain compressed into an object
+// stream is still followed. §7.5.7 forbids a stream object inside an object
+// stream, but the §A.4.1 markers live on the file specification dictionary,
+// which it permits — so the manifest bytes being visible does not make the store
+// identifiable, and a conforming document like this one yielded nothing.
+func TestPDFJUMBF_ObjectStreamChain(t *testing.T) {
+	store := synthJUMB([]byte("manifest store"))
+	doc := pdfObjStmDoc(t, store)
+	if bytes.Contains(doc, []byte(pdfC2PARelationship)) {
+		t.Fatal("the relationship marker is still visible in the plain bytes")
+	}
+	if got := pdfJUMBF(context.Background(), doc); !bytes.Equal(got, store) {
+		t.Fatalf("object-stream chain not recovered: got %d bytes, want %d", len(got), len(store))
+	}
+}
+
 // TestPDFJUMBF_Malformed feeds every truncation of a good document plus a set
 // of hand-broken ones. Nothing may panic, hang, or invent a manifest.
 func TestPDFJUMBF_Malformed(t *testing.T) {

@@ -18,11 +18,11 @@ import (
 // stream payload is the raw JUMBF store.
 
 // This is a lexical object scanner, not a full PDF parser: it indexes the
-// `N G obj … endobj` definitions it can see, follows that chain when it
-// resolves, and falls back to the spec's own markers when it does not — a
-// catalog or file specification compressed into an object stream is invisible.
-// A stream object may never live inside an object stream (PDF 32000-1 §7.5.7),
-// so the store itself is always visible even when the pointers to it are not.
+// `N G obj … endobj` definitions it can see, inflates the object streams among
+// them to index what those hold, and follows the chain from there. PDF 32000-1
+// §7.5.7 forbids a stream object inside an object stream but permits the file
+// specification dictionary carrying the §A.4.1 markers, so the store's bytes
+// being visible does not make the store identifiable — the chain is what does.
 
 // Incremental updates append rather than rewrite, so §A.4.2.1 makes the store
 // in the most recent update section the active manifest: here the last /Root
@@ -74,6 +74,11 @@ const maxPDFStoreAttempts = 32
 // maxPDFXrefHops bounds the /Prev chain followed looking for a trailer that
 // names /Root. Real documents name it in the newest trailer.
 const maxPDFXrefHops = 32
+
+// maxPDFObjectStreams caps how many object streams are inflated to index what
+// they hold, so a document full of them cannot spend the whole decompression
+// budget on the object index alone.
+const maxPDFObjectStreams = 16
 
 // pdfObject is one `N G obj … endobj` definition. body is a subslice of the
 // asset bytes running from just past the `obj` keyword to `endobj`, so a
@@ -141,6 +146,7 @@ func pdfJUMBF(ctx context.Context, data []byte) []byte {
 	if len(objs.order) == 0 {
 		return nil
 	}
+	objs.indexObjectStreams(ctx)
 	if store := pdfActiveStore(ctx, data, objs); store != nil {
 		return store
 	}
@@ -181,6 +187,70 @@ func indexPDFObjects(ctx context.Context, data []byte) *pdfObjects {
 		objs.order = append(objs.order, pdfObject{num: num, hdr: hdr, body: data[i:endobj]})
 	}
 	return objs
+}
+
+// indexObjectStreams adds the objects held inside every visible /Type /ObjStm.
+// §7.5.7 forbids a stream object in one, but it permits the file specification
+// dictionary that carries the §A.4.1 markers, so a conforming document can hide
+// its whole pointer chain there. An object stream is itself a visible stream,
+// which is what makes recovering the chain cheap.
+func (o *pdfObjects) indexObjectStreams(ctx context.Context) {
+	// Snapshot the length: the objects being added are not object streams
+	// themselves, since §7.5.7 forbids nesting them.
+	visible, streams := len(o.order), 0
+	for i := 0; i < visible && streams < maxPDFObjectStreams; i++ {
+		if ctx.Err() != nil {
+			return
+		}
+		body := o.order[i].body
+		if pdfName(pdfDict(body), "Type") != "ObjStm" {
+			continue
+		}
+		streams++
+		o.indexObjStm(body)
+	}
+}
+
+// indexObjStm adds what one object stream holds. Its payload opens with /N pairs
+// of object number and offset, each relative to /First, and the bodies follow in
+// the same order, so one pair's offset bounds the body before it.
+func (o *pdfObjects) indexObjStm(body []byte) {
+	dict, raw := pdfStreamPayload(body)
+	n, okN := pdfInt(dict, "N")
+	first, okF := pdfInt(dict, "First")
+	if len(raw) == 0 || !okN || !okF || n <= 0 || n > maxPDFObjects || first < 0 {
+		return
+	}
+	payload := o.decodeStream(dict, raw)
+	if first > len(payload) {
+		return
+	}
+	nums, offs, p := make([]int, 0, n), make([]int, 0, n), 0
+	for i := 0; i < n; i++ {
+		num, q, ok := pdfUint(payload, pdfSkipSpace(payload, p), first)
+		if !ok {
+			break
+		}
+		off, q, ok := pdfUint(payload, pdfSkipSpace(payload, q), first)
+		if !ok {
+			break
+		}
+		nums, offs, p = append(nums, num), append(offs, off), q
+	}
+	for i := range nums {
+		if len(o.order) >= maxPDFObjects {
+			return
+		}
+		start, end := first+offs[i], len(payload)
+		if i+1 < len(offs) {
+			end = min(end, first+offs[i+1])
+		}
+		if start < first || start > end {
+			continue
+		}
+		o.newest[nums[i]] = len(o.order)
+		o.order = append(o.order, pdfObject{num: nums[i], body: payload[start:end]})
+	}
 }
 
 // pdfObjNumber parses the `N G obj` header whose `obj` keyword starts at pos,
