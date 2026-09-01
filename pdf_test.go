@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/veraison/go-cose"
 )
 
 // --- synthetic PDF builders --------------------------------------------------
@@ -323,6 +325,68 @@ func TestReadPDF_RealManifest(t *testing.T) {
 	doc := synthPDF(t, extractJUMBF(ctx, JPEG, data), true)
 	if got := Read(ctx, PDF, bytes.NewReader(doc)); got != want {
 		t.Fatalf("Read(PDF) = %+v\nwant %+v", got, want)
+	}
+}
+
+// TestValidatePDF_ProducerShapes validates a generated PDF whose carrier uses
+// the four shapes an observed producer emits and the corpus's own PDF case does
+// not — each on a different branch of the scan: the generation number in the
+// object header and in /Root, /Type spelled /FileSpec, a /Subtype read by
+// pdfText's literal-string branch rather than as a name, and a manifest that
+// only the incremental update section associates.
+func TestValidatePDF_ProducerShapes(t *testing.T) {
+	spec := func(sb *signerBundle) manifestSpec {
+		return manifestSpec{signer: sb, assertions: []assertionSpec{markerAssertion()}}
+	}
+
+	t.Run("catalog chain", func(t *testing.T) {
+		sb := newCorpusSigner(t, cose.AlgorithmES256)
+		asset := buildFramedAsset(t, pdfProducerFraming(true), spec(sb))
+		for shape, want := range map[string]string{
+			"catalog at generation 1": "/Root 5 1 R",
+			"capital-S file spec":     "/Type /FileSpec",
+			"literal-string subtype":  "/Subtype (application/c2pa)",
+			"incremental update":      "/Prev ",
+		} {
+			if !bytes.Contains(asset, []byte(want)) {
+				t.Fatalf("%s: asset does not carry %q", shape, want)
+			}
+		}
+		assertPDFProducerValid(t, asset, sb)
+	})
+
+	// The chain resolving is what keeps /Subtype off the path above, so the
+	// literal-string branch only carries a document whose chain is compressed
+	// out of sight.
+	t.Run("literal subtype alone", func(t *testing.T) {
+		sb := newCorpusSigner(t, cose.AlgorithmES256)
+		ctx := context.Background()
+		asset := buildFramedAsset(t, pdfProducerFraming(false), spec(sb))
+		if bytes.Contains(asset, []byte(pdfC2PARelationship)) {
+			t.Fatal("asset still carries the relationship marker")
+		}
+		if pdfActiveStore(ctx, asset, indexPDFObjects(ctx, asset)) != nil {
+			t.Fatal("the catalog chain still resolves, so /Subtype is not the route")
+		}
+		assertPDFProducerValid(t, asset, sb)
+	})
+}
+
+func assertPDFProducerValid(t *testing.T, asset []byte, sb *signerBundle) {
+	t.Helper()
+	res := runCorpus(t, PDF, asset, sb)
+	if !res.Valid {
+		t.Fatalf("expected valid, got %v", codes(res))
+	}
+	for _, want := range []StatusCode{
+		StatusClaimSignatureValidated,
+		StatusSigningCredentialTrusted,
+		StatusAssertionHashedURIMatch,
+		StatusAssertionDataHashMatch,
+	} {
+		if !res.Has(want) {
+			t.Errorf("missing %s; got %v", want, codes(res))
+		}
 	}
 }
 
