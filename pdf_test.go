@@ -633,31 +633,48 @@ func pdfOpenArrayDoc(kib int, tok string) []byte {
 	return append(doc, bytes.Repeat([]byte(tok), kib*1024/len(tok))...)
 }
 
-// TestPDFJUMBF_UnterminatedArrayCost pins a ceiling on the `/Root[` shape. `[`
-// is a delimiter, so the name token matches and opens an array; searching for
-// the `]` that never arrives costs the rest of the buffer, once per /Root, over
-// every /Root. The ceilings are wall-clock because the growth rate is the
-// defect: unbounded, 1 MiB cost ~1.5s and Read's cap is 16 MiB of it.
+// TestPDFJUMBF_UnterminatedArrayCost pins the bounds behind the `/Root[` shape.
+// `[` is a delimiter, so the name token matches and opens an array; searching for
+// the `]` that never arrives cost the rest of the buffer, once per /Root, over
+// every /Root — quadratic, and minutes at Read's 16 MiB cap. The window bound and
+// the context check are asserted directly, since a wall-clock ceiling tight
+// enough to catch the defect also fails under -race on a shared runner.
 func TestPDFJUMBF_UnterminatedArrayCost(t *testing.T) {
-	t.Run("bounded array window", func(t *testing.T) {
+	t.Run("array window is bounded", func(t *testing.T) {
+		b := append([]byte("["), bytes.Repeat([]byte("0 0 R "), 1<<16)...)
+		if got, want := pdfArrayEnd(b, 1), 1+maxPDFDictScan; got != want {
+			t.Fatalf("pdfArrayEnd = %d, want the window bound %d", got, want)
+		}
+		// A closing bracket inside the window is still what ends the array.
+		b[1+64] = ']'
+		if got, want := pdfArrayEnd(b, 1), 1+64; got != want {
+			t.Fatalf("pdfArrayEnd = %d, want the bracket at %d", got, want)
+		}
+	})
+
+	t.Run("root scan honours the context", func(t *testing.T) {
+		// The trailer's /Root resolves, so without the check the scan finds it.
+		doc := append(pdfOpenArrayDoc(64, "/Root["), "trailer\n<< /Root 1 0 R >>\n"...)
+		if root, ok := pdfRootLexical(context.Background(), doc); !ok || root != 1 {
+			t.Fatalf("pdfRootLexical = (%d, %v), want (1, true) without a deadline", root, ok)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if root, ok := pdfRootLexical(ctx, doc); ok {
+			t.Fatalf("a cancelled context still resolved /Root to %d", root)
+		}
+	})
+
+	// A smoke guard, not the pin: generous enough for -race on a shared runner,
+	// where the bounded scan of this document has been seen to take ~0.6s.
+	t.Run("whole scan finishes", func(t *testing.T) {
 		doc := pdfOpenArrayDoc(1024, "/Root[")
 		start := time.Now()
 		if got := pdfJUMBF(context.Background(), doc); got != nil {
 			t.Fatalf("yielded %d bytes", len(got))
 		}
-		if d := time.Since(start); d > 300*time.Millisecond {
-			t.Fatalf("1 MiB of unterminated arrays took %v, want under 300ms", d)
-		}
-	})
-
-	t.Run("deadline honoured", func(t *testing.T) {
-		doc := pdfOpenArrayDoc(1024, "/Root[")
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-		start := time.Now()
-		pdfJUMBF(ctx, doc)
-		if d := time.Since(start); d > 400*time.Millisecond {
-			t.Fatalf("a 50ms deadline did not stop the scan: took %v", d)
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("1 MiB of unterminated arrays took %v", d)
 		}
 	})
 }
