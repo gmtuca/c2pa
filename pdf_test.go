@@ -433,6 +433,132 @@ func TestPDFJUMBF_AuthoritativeCatalog(t *testing.T) {
 	})
 }
 
+// xrefStream appends a real cross-reference stream over the objects written so
+// far — /W [1 2 1] rows, type 1 entries carrying a two-byte offset — and a
+// startxref naming it. This is what a PDF 1.5+ producer writes instead of a
+// table, and without decoding it the catalog has no location.
+func (d *pdfDoc) xrefStream(num, root int) *pdfDoc {
+	high := num
+	for n := range d.offs {
+		high = max(high, n)
+	}
+	var rows bytes.Buffer
+	for n := 0; n <= high; n++ {
+		if off, ok := d.offs[n]; ok {
+			rows.Write([]byte{1, byte(off >> 8), byte(off), 0})
+		} else {
+			rows.Write([]byte{0, 0, 0, 0})
+		}
+	}
+	at := len(d.b)
+	d.stream(num, fmt.Sprintf("/Type /XRef /Size %d /Root %d 0 R /W [1 2 1]", high+1, root),
+		rows.Bytes(), "")
+	return d.append(fmt.Sprintf("startxref\n%d\n%%%%EOF\n", at))
+}
+
+// TestPDFJUMBF_XrefStreamPlacesTheCatalog pins that a document using a
+// cross-reference stream is protected the same way one using a table is. Without
+// decoding the stream's /W rows the catalog has no location, lexical order
+// decides, and the decoy appended after %%EOF wins — on the carrier most modern
+// producers write.
+func TestPDFJUMBF_XrefStreamPlacesTheCatalog(t *testing.T) {
+	ctx := context.Background()
+	store := synthJUMB([]byte("manifest store"))
+
+	genuine := newPDFDoc().
+		obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>").
+		obj(2, "<< /Type /Pages /Kids [] /Count 0 >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, store, "").
+		xrefStream(6, 1)
+
+	if _, got, src := pdfScan(ctx, genuine.bytes()); !bytes.Equal(got, store) ||
+		src != pdfStoreCatalog {
+		t.Fatalf("genuine document: got %q source %v", got, src)
+	}
+
+	tampered := genuine.clone().append(
+		"1 0 obj\n<< /Type /Catalog /AF [901 0 R] >>\nendobj\n" +
+			"901 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest" +
+			" /EF << /F 902 0 R >> >>\nendobj\n" +
+			fmt.Sprintf("902 0 obj\n<< /Type /EmbeddedFile /Length %d >>\nstream\n%s\n"+
+				"endstream\nendobj\n", len(pdfEmptyJUMB), pdfEmptyJUMB)).bytes()
+
+	if _, got, src := pdfScan(ctx, tampered); !bytes.Equal(got, store) ||
+		src != pdfStoreCatalog {
+		t.Fatalf("decoy redirected an xref-stream document: got %q source %v", got, src)
+	}
+}
+
+// TestPDFJUMBF_CompressedObjectDoesNotDisplaceAVisibleOne pins revision order.
+// An object stream's contents are indexed after every visible object, and file
+// order says nothing about which revision they belong to, so taking the newest
+// entry outright let a stale compressed catalog beat one an incremental update
+// appended in plain sight — reviving a superseded store.
+func TestPDFJUMBF_CompressedObjectDoesNotDisplaceAVisibleOne(t *testing.T) {
+	superseded := synthJUMB([]byte("the superseded store"))
+	current := synthJUMB([]byte("the current store"))
+
+	inner := map[int]string{
+		1: "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>",
+		3: "<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 4 0 R >> >>",
+	}
+	var hdr, bodies string
+	for _, n := range []int{1, 3} {
+		hdr += fmt.Sprintf("%d %d ", n, len(bodies))
+		bodies += inner[n] + " "
+	}
+
+	d := newPDFDoc()
+	d.stream(5, fmt.Sprintf("/Type /ObjStm /N 2 /First %d /Filter /FlateDecode", len(hdr)),
+		zlibBytes(t, []byte(hdr+bodies)), "")
+	d.stream(4, pdfEmbeddedFileDict, superseded, "")
+	d.append("trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n")
+	// An incremental update rewrites the catalog in plain sight.
+	d.obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [7 0 R] >>").
+		obj(7, "<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 8 0 R >> >>").
+		stream(8, pdfEmbeddedFileDict, current, "").
+		append("trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n")
+
+	if got := pdfJUMBF(context.Background(), d.bytes()); !bytes.Equal(got, current) {
+		t.Fatalf("got %q want the update's store", got)
+	}
+}
+
+// TestPDFJUMBF_DecoyObjectStreamsCannotDrainBudget pins that inflating an object
+// stream is charged only for a payload whose objects are kept. Two 16 KiB decoys
+// that expand to 8 MiB of nothing otherwise spend the whole budget and starve the
+// stream carrying the real chain.
+func TestPDFJUMBF_DecoyObjectStreamsCannotDrainBudget(t *testing.T) {
+	store := synthJUMB([]byte("manifest store"))
+	inner := map[int]string{
+		1: "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>",
+		3: "<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 4 0 R >> >>",
+	}
+	var hdr, bodies string
+	for _, n := range []int{1, 3} {
+		hdr += fmt.Sprintf("%d %d ", n, len(bodies))
+		bodies += inner[n] + " "
+	}
+	junk := zlibBytes(t, bytes.Repeat([]byte("x"), maxPDFStreamInflate))
+
+	d := newPDFDoc()
+	d.stream(10, "/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode", junk, "")
+	d.stream(11, "/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode", junk, "")
+	d.stream(5, fmt.Sprintf("/Type /ObjStm /N 2 /First %d /Filter /FlateDecode", len(hdr)),
+		zlibBytes(t, []byte(hdr+bodies)), "")
+	// No /Subtype, as the one real producer file available carries none, so the
+	// marker fallback cannot quietly rescue this.
+	d.stream(4, "/Type /EmbeddedFile", store, "")
+	d.append("trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n")
+
+	if _, got, src := pdfScan(context.Background(), d.bytes()); !bytes.Equal(got, store) ||
+		src != pdfStoreCatalog {
+		t.Fatalf("decoy object streams suppressed the chain: got %d bytes source %v",
+			len(got), src)
+	}
+}
+
 // TestPDFJUMBF_MarkerFallback covers the documents whose pointer chain is not
 // visible to a lexical scan — a catalog or file specification compressed into an
 // object stream. The embedded file stream itself always is, so the extractor

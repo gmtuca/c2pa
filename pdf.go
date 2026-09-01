@@ -87,13 +87,28 @@ const maxPDFObjectStreams = 16
 
 // pdfObject is one `N G obj … endobj` definition. body is a subslice of the
 // asset bytes running from just past the `obj` keyword to `endobj`, so a
-// stream's payload stays addressable. hdr is where the definition starts, which
-// is what a cross-reference entry holds.
+// stream's payload stays addressable. hdr is where the definition starts; for
+// one recovered from an object stream, stm and idx say which stream held it and
+// where. A cross-reference entry names one or the other.
 type pdfObject struct {
 	num  int
 	hdr  int
+	stm  int
+	idx  int
 	body []byte
 }
+
+// pdfXrefLoc is where a cross-reference section says an object's current
+// definition lives: at a byte offset (a type 1 entry), or at an index inside an
+// object stream (type 2).
+type pdfXrefLoc struct {
+	offset int
+	stm    int
+	idx    int
+}
+
+// found reports whether the section actually placed the object.
+func (l pdfXrefLoc) found() bool { return l.offset > 0 || l.stm > 0 }
 
 // pdfObjects is the indexed object graph: every definition in file order, plus
 // a lookup that resolves an object number to its newest definition.
@@ -103,28 +118,57 @@ type pdfObjects struct {
 	inflate int         // decompression budget left for this extraction
 }
 
-// body returns the newest definition of an object number, or nil when the
-// object is not visible (typically because it lives in an object stream).
+// body returns the newest visible definition of an object number, falling back
+// to one recovered from an object stream. Visible wins because newest holds only
+// definitions this scan can place, and a compressed definition it cannot place
+// must not displace one an incremental update appended. The cost is fidelity the
+// other way — an update that compresses an object the base section wrote plainly
+// — which the catalog avoids by going through the cross-reference section.
 func (o *pdfObjects) body(num int) []byte {
 	if i, ok := o.newest[num]; ok {
 		return o.order[i].body
 	}
+	for i := len(o.order) - 1; i >= 0; i-- {
+		if o.order[i].num == num && o.order[i].stm > 0 {
+			return o.order[i].body
+		}
+	}
 	return nil
 }
 
-// catalog returns the document catalog's body. A non-zero off is the offset the
-// cross-reference section gave for it, and is authoritative: it is the only way
-// to tell the real definition from a phantom `N G obj` in a content stream.
-// Without one, the newest definition that /Type says is a catalog stands.
-func (o *pdfObjects) catalog(num, off int) []byte {
-	for i := range o.order {
-		if off > 0 && o.order[i].hdr == off && o.order[i].num == num {
-			return pdfIfCatalog(o.order[i].body)
+// catalog returns the document catalog's body. When a cross-reference section
+// placed it, that placement is the only thing consulted: lexical order is what
+// an appended decoy or a phantom `N G obj` in a content stream exploits, so a
+// placement that does not resolve fails closed rather than guessing. Only a
+// document with no usable section at all falls back to the newest definition.
+func (o *pdfObjects) catalog(num int, loc pdfXrefLoc, placed bool) []byte {
+	if placed {
+		if !loc.found() {
+			return nil
 		}
+		for i := range o.order {
+			ob := o.order[i]
+			if ob.num != num {
+				continue
+			}
+			if (loc.stm > 0 && ob.stm == loc.stm && ob.idx == loc.idx) ||
+				(loc.offset > 0 && ob.hdr == loc.offset) {
+				return pdfIfCatalog(ob.body)
+			}
+		}
+		return nil
 	}
-	for i := len(o.order) - 1; i >= 0; i-- {
-		if o.order[i].num == num {
-			if body := pdfIfCatalog(o.order[i].body); body != nil {
+	// Visible definitions first. An object stream's contents are indexed after
+	// every visible object, and file order says nothing about which revision
+	// they belong to, so taking the last entry outright lets a stale compressed
+	// catalog displace one an incremental update appended in plain sight.
+	for _, compressed := range []bool{false, true} {
+		for i := len(o.order) - 1; i >= 0; i-- {
+			ob := o.order[i]
+			if ob.num != num || (ob.stm > 0) != compressed {
+				continue
+			}
+			if body := pdfIfCatalog(ob.body); body != nil {
 				return body
 			}
 		}
@@ -247,14 +291,14 @@ func (o *pdfObjects) indexObjectStreams(ctx context.Context) {
 			continue
 		}
 		streams++
-		o.indexObjStm(body)
+		o.indexObjStm(o.order[i].num, body)
 	}
 }
 
 // indexObjStm adds what one object stream holds. Its payload opens with /N pairs
 // of object number and offset, each relative to /First, and the bodies follow in
 // the same order, so one pair's offset bounds the body before it.
-func (o *pdfObjects) indexObjStm(body []byte) {
+func (o *pdfObjects) indexObjStm(stm int, body []byte) {
 	dict, raw := pdfStreamPayload(body)
 	n, okN := pdfInt(dict, "N")
 	first, okF := pdfInt(dict, "First")
@@ -264,10 +308,6 @@ func (o *pdfObjects) indexObjStm(body []byte) {
 	payload, inflated := o.decodeStream(dict, raw)
 	if first > len(payload) {
 		return
-	}
-	if inflated {
-		// The payload is kept: every body indexed below is a slice of it.
-		o.inflate -= len(payload)
 	}
 	nums, offs, p := make([]int, 0, n), make([]int, 0, n), 0
 	for i := 0; i < n; i++ {
@@ -281,6 +321,15 @@ func (o *pdfObjects) indexObjStm(body []byte) {
 		}
 		nums, offs, p = append(nums, num), append(offs, off), q
 	}
+	if len(nums) == 0 {
+		// Nothing was indexed, so nothing of this payload is kept and the shared
+		// budget must not be charged for it — two decoys that decode to garbage
+		// would otherwise spend it all and starve the stream holding the chain.
+		return
+	}
+	if inflated {
+		o.inflate -= len(payload)
+	}
 	for i := range nums {
 		if len(o.order) >= maxPDFObjects {
 			return
@@ -292,8 +341,13 @@ func (o *pdfObjects) indexObjStm(body []byte) {
 		if start < first || start > end {
 			continue
 		}
-		o.newest[nums[i]] = len(o.order)
-		o.order = append(o.order, pdfObject{num: nums[i], body: payload[start:end]})
+		// newest is deliberately not updated: file order says nothing about which
+		// revision an object stream belongs to, so a stale compressed definition
+		// must not displace a visible one an incremental update appended. The
+		// cross-reference section is what places these, via stm and idx.
+		o.order = append(o.order, pdfObject{
+			num: nums[i], stm: stm, idx: i, body: payload[start:end],
+		})
 	}
 }
 
@@ -366,13 +420,14 @@ func pdfObjNumber(data []byte, pos int) (num, hdr int, ok bool) {
 // the store in its /EF stream. Returns nil when that chain names no C2PA file,
 // which is the only thing that can attribute a store to the document.
 func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) []byte {
-	root, off, ok := pdfXrefRoot(ctx, data)
-	if !ok {
+	root, loc, placed := pdfXrefRoot(ctx, data, objs)
+	if !placed {
+		var ok bool
 		if root, ok = pdfRootLexical(ctx, data); !ok {
 			return nil
 		}
 	}
-	catalog := objs.catalog(root, off)
+	catalog := objs.catalog(root, loc, placed)
 	if catalog == nil {
 		return nil
 	}
@@ -693,84 +748,191 @@ func pdfDrain(r io.Reader, limit int) []byte {
 // trailer names /Root. off is where that section says the catalog lives, 0 when
 // it does not spell an offset out. Bytes appended after %%EOF carry no section
 // of their own, so they cannot redirect the document.
-func pdfXrefRoot(ctx context.Context, data []byte) (root, off int, ok bool) {
+func pdfXrefRoot(
+	ctx context.Context,
+	data []byte,
+	objs *pdfObjects,
+) (root int, loc pdfXrefLoc, ok bool) {
 	p := bytes.LastIndex(data, []byte("startxref"))
 	if p < 0 {
-		return 0, 0, false
+		return 0, loc, false
 	}
 	pos, _, ok := pdfUint(data, pdfSkipSpace(data, p+len("startxref")), len(data))
 	if !ok {
-		return 0, 0, false
+		return 0, loc, false
 	}
+	// The whole chain is walked, not just the section naming /Root: an object
+	// the newest update did not touch is placed by an older section. Earlier
+	// sections never overwrite what a newer one already said.
+	locs, found := map[int]pdfXrefLoc{}, false
 	for hop := 0; hop < maxPDFXrefHops; hop++ {
 		if ctx.Err() != nil || pos <= 0 || pos >= len(data) {
-			return 0, 0, false
+			break
 		}
-		trailer, offsets := pdfXrefSection(data, pos)
+		trailer := pdfXrefSection(data, pos, objs, locs)
 		if trailer == nil {
-			return 0, 0, false
+			break
 		}
-		if refs := pdfRefs(trailer, "Root", 1); len(refs) == 1 {
-			return refs[0], offsets[refs[0]], true
+		if !found {
+			if refs := pdfRefs(trailer, "Root", 1); len(refs) == 1 {
+				root, found = refs[0], true
+			}
 		}
-		if pos, ok = pdfInt(trailer, "Prev"); !ok {
-			return 0, 0, false
+		prev, hasPrev := pdfInt(trailer, "Prev")
+		if !hasPrev {
+			break
 		}
+		pos = prev
 	}
-	return 0, 0, false
+	if !found {
+		return 0, pdfXrefLoc{}, false
+	}
+	return root, locs[root], true
 }
 
 // pdfXrefSection returns the trailer dictionary of the cross-reference section
-// at pos, plus each in-use object's offset when it is a classic table. An xref
-// stream keeps the trailer entries in its own object dictionary and its offsets
-// in a compressed payload, so only the dictionary is read.
-func pdfXrefSection(data []byte, pos int) ([]byte, map[int]int) {
+// at pos and places the objects it lists into locs, which an earlier section
+// never overwrites.
+func pdfXrefSection(data []byte, pos int, objs *pdfObjects, locs map[int]pdfXrefLoc) []byte {
 	p := pdfSkipSpace(data, pos)
 	if bytes.HasPrefix(data[p:], []byte("xref")) {
-		return pdfClassicXref(data, p+len("xref"))
+		return pdfClassicXref(data, p+len("xref"), locs)
 	}
-	if k := bytes.Index(data[p:min(len(data), p+maxPDFDictScan)], []byte("obj")); k >= 0 {
-		return pdfDict(data[p+k+len("obj"):]), nil
+	return pdfXrefStream(data, p, objs, locs)
+}
+
+// place records where an object lives, unless a newer section already did.
+func pdfPlace(locs map[int]pdfXrefLoc, num int, loc pdfXrefLoc) {
+	if len(locs) <= maxPDFObjects {
+		if _, seen := locs[num]; !seen {
+			locs[num] = loc
+		}
 	}
-	return nil, nil
 }
 
 // pdfClassicXref reads a cross-reference table's subsections and the trailer
-// that follows them, collecting the byte offset of every in-use entry.
-func pdfClassicXref(data []byte, p int) ([]byte, map[int]int) {
-	offsets := map[int]int{}
-	for len(offsets) <= maxPDFObjects {
+// that follows them, placing every in-use entry at its byte offset.
+func pdfClassicXref(data []byte, p int, locs map[int]pdfXrefLoc) []byte {
+	for rows := 0; rows <= maxPDFObjects; {
 		p = pdfSkipSpace(data, p)
 		if bytes.HasPrefix(data[p:], []byte("trailer")) {
-			return pdfDict(data[p+len("trailer"):]), offsets
+			return pdfDict(data[p+len("trailer"):])
 		}
 		first, q, ok := pdfUint(data, p, len(data))
 		if !ok {
-			return nil, nil
+			return nil
 		}
 		count, q, ok := pdfUint(data, pdfSkipSpace(data, q), len(data))
 		if !ok || count > maxPDFObjects {
-			return nil, nil
+			return nil
 		}
 		for i := 0; i < count; i++ {
 			var entry int
 			if entry, q, ok = pdfUint(data, pdfSkipSpace(data, q), len(data)); !ok {
-				return nil, nil
+				return nil
 			}
 			if _, q, ok = pdfUint(data, pdfSkipSpace(data, q), len(data)); !ok {
-				return nil, nil
+				return nil
 			}
 			if q = pdfSkipSpace(data, q); q >= len(data) {
-				return nil, nil
+				return nil
 			}
 			if data[q] == 'n' {
-				offsets[first+i] = entry
+				pdfPlace(locs, first+i, pdfXrefLoc{offset: entry})
 			}
 			q++
+			rows++
 		}
 		p = q
 	}
-	return nil, nil
+	return nil
+}
+
+// pdfXrefStream reads a cross-reference stream: an ordinary object whose own
+// dictionary carries the trailer entries, and whose payload is fixed-width rows
+// of /W bytes covering the object ranges /Index names. Without decoding it the
+// catalog has no location, and lexical order is exactly what an appended decoy
+// exploits.
+func pdfXrefStream(data []byte, p int, objs *pdfObjects, locs map[int]pdfXrefLoc) []byte {
+	k := bytes.Index(data[p:min(len(data), p+maxPDFDictScan)], []byte("obj"))
+	if k < 0 {
+		return nil
+	}
+	body := data[p+k+len("obj"):]
+	dict := pdfDict(body)
+
+	w := pdfIntList(dict, "W", 3)
+	_, raw := pdfStreamPayload(body)
+	if len(w) != 3 || len(raw) == 0 {
+		return dict // not a decodable xref stream; the trailer entries still stand
+	}
+	row := w[0] + w[1] + w[2]
+	if row <= 0 || row > 32 {
+		return dict
+	}
+	payload, inflated := objs.decodeStream(dict, raw)
+	if inflated {
+		objs.inflate -= len(payload)
+	}
+	index := pdfIntList(dict, "Index", 2*maxPDFXrefHops)
+	if len(index) < 2 {
+		size, ok := pdfInt(dict, "Size")
+		if !ok {
+			return dict
+		}
+		index = []int{0, size}
+	}
+
+	at := 0
+	field := func(off, n int) int {
+		v := 0
+		for _, b := range payload[off : off+n] {
+			v = v<<8 | int(b)
+		}
+		return v
+	}
+	for i := 0; i+1 < len(index); i += 2 {
+		first, count := index[i], index[i+1]
+		for j := 0; j < count && at+row <= len(payload); j++ {
+			kind := 1 // /W[0] of zero means every entry is type 1
+			if w[0] > 0 {
+				kind = field(at, w[0])
+			}
+			switch kind {
+			case 1:
+				pdfPlace(locs, first+j, pdfXrefLoc{offset: field(at+w[0], w[1])})
+			case 2:
+				pdfPlace(locs, first+j, pdfXrefLoc{
+					stm: field(at+w[0], w[1]),
+					idx: field(at+w[0]+w[1], w[2]),
+				})
+			}
+			at += row
+		}
+	}
+	return dict
+}
+
+// pdfIntList reads /key as an array of direct integers.
+func pdfIntList(b []byte, key string, max int) []int {
+	p := pdfFindName(b, key, 0)
+	if p < 0 {
+		return nil
+	}
+	if p = pdfSkipSpace(b, p); p >= len(b) || b[p] != '[' {
+		return nil
+	}
+	p++
+	end := pdfArrayEnd(b, p)
+	var out []int
+	for len(out) < max {
+		v, next, ok := pdfUint(b, pdfSkipSpace(b, p), end)
+		if !ok {
+			break
+		}
+		out, p = append(out, v), next
+	}
+	return out
 }
 
 // pdfRootLexical returns the object number of the document catalog by scanning
