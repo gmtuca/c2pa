@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -323,14 +324,16 @@ func TestPDFJUMBF_IncrementalUpdate(t *testing.T) {
 		}
 	})
 	t.Run("association dropped by the update", func(t *testing.T) {
-		// The newest catalog associates no C2PA manifest, but §15.5.2.2 keeps a
-		// store from an earlier update section valid, so the first one stands.
+		// §A.4.2.1 makes the catalog's /AF the active manifest, so a catalog
+		// that associates none leaves the document claiming no provenance. The
+		// superseded store is still in the bytes; reporting it as the active
+		// manifest would attribute to the document something it dropped.
 		doc := base.clone().
 			obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [5 0 R] >>").
 			obj(5, "<< /Type /Filespec /F (notes.txt) /AFRelationship /Supplement >>").
 			trailer(1).bytes()
-		if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, first) {
-			t.Fatalf("got %q want the earlier update's manifest", got)
+		if got := pdfJUMBF(ctx, doc); got != nil {
+			t.Fatalf("got %q want no manifest: the current catalog associates none", got)
 		}
 	})
 }
@@ -465,6 +468,51 @@ func TestPDFJUMBF_ObjectStreamChain(t *testing.T) {
 	if got := pdfJUMBF(context.Background(), doc); !bytes.Equal(got, store) {
 		t.Fatalf("object-stream chain not recovered: got %d bytes, want %d", len(got), len(store))
 	}
+}
+
+// TestPDFJUMBF_AttachmentManifestIsNotTheDocument pins that the markers alone do
+// not attribute a store to the document. §A.4.3 gives an object-level manifest
+// the identical /AFRelationship, and §A.4.2.1 puts the document-level file
+// specification in the EmbeddedFiles name tree as well, so the catalog's /AF
+// reference is the only discriminator — and here it names something else.
+func TestPDFJUMBF_AttachmentManifestIsNotTheDocument(t *testing.T) {
+	store := synthJUMB([]byte("an attachment's manifest"))
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>").
+		obj(2, "<< /Type /Pages /Kids [] /Count 0 >>").
+		obj(3, "<< /Type /Filespec /F (notes.txt) /AFRelationship /Supplement >>").
+		obj(7, "<< /Type /Filespec /F (image.jpg) /AFRelationship /C2PA_Manifest"+
+			" /EF << /F 8 0 R >> >>").
+		stream(8, pdfEmbeddedFileDict, store, "").
+		xrefTrailer(1).bytes()
+	if got := pdfJUMBF(context.Background(), doc); got != nil {
+		t.Fatalf("an attachment's manifest was reported as the document's: got %q", got)
+	}
+}
+
+// TestValidatePDF_MarkerSourcedStoreIsReported pins that a store found by the
+// markers, with no catalog to attribute it, is reported as such — the result
+// could not otherwise express "found a manifest, cannot prove it is this
+// document's".
+func TestValidatePDF_MarkerSourcedStoreIsReported(t *testing.T) {
+	pool, data := fixtureSigningPool(t)
+	ctx := context.Background()
+	// No catalog is visible, so the markers are the only route left.
+	doc := newPDFDoc().
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, extractJUMBF(ctx, JPEG, data), "").
+		trailer(1).bytes()
+
+	r := Validate(ctx, PDF, bytes.NewReader(doc), WithSigningTrust(pool))
+	if !r.Has(StatusClaimSignatureValidated) {
+		t.Fatalf("signature not validated through the fallback: %v", codes(r))
+	}
+	for _, s := range r.Statuses {
+		if s.Code == StatusUnsupported && strings.Contains(s.Explanation, "markers") {
+			return
+		}
+	}
+	t.Errorf("no status says the store was identified by its markers: %+v", r.Statuses)
 }
 
 // TestPDFJUMBF_Malformed feeds every truncation of a good document plus a set
@@ -644,8 +692,8 @@ func TestValidatePDF_ProducerShapes(t *testing.T) {
 		if bytes.Contains(asset, []byte(pdfC2PARelationship)) {
 			t.Fatal("asset still carries the relationship marker")
 		}
-		if pdfActiveStore(ctx, asset, indexPDFObjects(ctx, asset)) != nil {
-			t.Fatal("the catalog chain still resolves, so /Subtype is not the route")
+		if store, resolved := pdfActiveStore(ctx, asset, indexPDFObjects(ctx, asset)); store != nil || resolved {
+			t.Fatal("the catalog still resolves, so /Subtype is not the route")
 		}
 		assertPDFProducerValid(t, asset, sb)
 	})
@@ -678,7 +726,7 @@ func TestValidatePDF_ReportsUnevaluatedStores(t *testing.T) {
 	store := extractJUMBF(ctx, JPEG, data)
 
 	one := synthPDF(t, store, false)
-	if n := pdfStoreCount(ctx, one); n != 1 {
+	if n := pdfStoreCount(ctx, indexPDFObjects(ctx, one)); n != 1 {
 		t.Fatalf("single-store document counted %d stores", n)
 	}
 	two := newPDFDoc().
@@ -690,7 +738,7 @@ func TestValidatePDF_ReportsUnevaluatedStores(t *testing.T) {
 		obj(5, "<< /AFRelationship /C2PA_Manifest /EF << /F 6 0 R >> >>").
 		stream(6, pdfEmbeddedFileDict, store, "").
 		trailer(1).bytes()
-	if n := pdfStoreCount(ctx, two); n != 2 {
+	if n := pdfStoreCount(ctx, indexPDFObjects(ctx, two)); n != 2 {
 		t.Fatalf("re-signed document counted %d stores, want 2", n)
 	}
 

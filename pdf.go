@@ -141,21 +141,53 @@ func pdfIfCatalog(body []byte) []byte {
 	return nil
 }
 
+// pdfStoreSource says how a store was found. §A.4.1's markers are identical on a
+// document-level manifest and on the object-level one §A.4.3 describes, so only
+// the catalog's /AF reference attributes a store to the document.
+type pdfStoreSource int
+
+const (
+	pdfStoreNone pdfStoreSource = iota
+	// pdfStoreCatalog: reached through the catalog's /AF, so it is the
+	// document's active manifest.
+	pdfStoreCatalog
+	// pdfStoreMarker: found by the markers with no catalog to attribute it, so
+	// it may govern an embedded file rather than the document.
+	pdfStoreMarker
+)
+
 // pdfJUMBF locates the C2PA manifest store in a PDF and returns its raw JUMBF
 // bytes. Returns nil when the document carries none.
 func pdfJUMBF(ctx context.Context, data []byte) []byte {
+	_, store, _ := pdfScan(ctx, data)
+	return store
+}
+
+// pdfScan locates the store and reports how it was found, returning the object
+// index so a caller can ask more of it without indexing the document again.
+func pdfScan(ctx context.Context, data []byte) (*pdfObjects, []byte, pdfStoreSource) {
 	if !bytes.Contains(data[:min(len(data), maxPDFHeaderSearch)], []byte("%PDF-")) {
-		return nil
+		return nil, nil, pdfStoreNone
 	}
 	objs := indexPDFObjects(ctx, data)
 	if len(objs.order) == 0 {
-		return nil
+		return objs, nil, pdfStoreNone
 	}
 	objs.indexObjectStreams(ctx)
-	if store := pdfActiveStore(ctx, data, objs); store != nil {
-		return store
+	store, resolved := pdfActiveStore(ctx, data, objs)
+	if store != nil {
+		return objs, store, pdfStoreCatalog
 	}
-	return pdfMarkedStore(ctx, objs)
+	if resolved {
+		// The catalog was readable and associated no C2PA file. Its /AF is the
+		// only thing that can attribute a store to the document, so scanning for
+		// markers here would report an attachment's manifest as the document's.
+		return objs, nil, pdfStoreNone
+	}
+	if store = pdfMarkedStore(ctx, objs); store != nil {
+		return objs, store, pdfStoreMarker
+	}
+	return objs, nil, pdfStoreNone
 }
 
 // indexPDFObjects indexes every visible indirect object definition. A later
@@ -296,19 +328,19 @@ func pdfObjNumber(data []byte, pos int) (num, hdr int, ok bool) {
 // pdfActiveStore returns the active manifest by the route §A.4.2.1 defines: the
 // current trailer's /Root names the document catalog, whose /AF array lists the
 // associated files, and the one whose /AFRelationship is /C2PA_Manifest carries
-// the store in its /EF stream. Returns nil when that chain does not resolve —
-// no /Root, or a catalog or file specification compressed into an object
-// stream.
-func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) []byte {
+// the store in its /EF stream. resolved reports whether the catalog itself was
+// read, which is what separates "this document associates no manifest" from
+// "the pointer chain could not be followed".
+func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) (store []byte, resolved bool) {
 	root, off, ok := pdfXrefRoot(ctx, data)
 	if !ok {
 		if root, ok = pdfRootLexical(ctx, data); !ok {
-			return nil
+			return nil, false
 		}
 	}
 	catalog := objs.catalog(root, off)
 	if catalog == nil {
-		return nil
+		return nil, false
 	}
 	refs := pdfRefs(catalog, "AF", maxPDFAssociatedFiles)
 	if len(refs) == 1 {
@@ -319,17 +351,17 @@ func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) []byte {
 	}
 	for _, ref := range refs {
 		if ctx.Err() != nil {
-			return nil
+			return nil, false
 		}
 		filespec := objs.body(ref)
 		if filespec == nil || pdfName(pdfDict(filespec), "AFRelationship") != pdfC2PARelationship {
 			continue
 		}
 		if store := pdfEmbeddedStore(ctx, objs, filespec); store != nil {
-			return store
+			return store, true
 		}
 	}
-	return nil
+	return nil, true
 }
 
 // pdfMarkedStore scans the visible objects, newest first, for a C2PA embedded
@@ -369,9 +401,12 @@ func pdfMarkedStore(ctx context.Context, objs *pdfObjects) []byte {
 // extractor does not evaluate: earlier update sections' stores, which
 // §A.4.2.1 asks a consumer to process together with the active one, or
 // object-level manifests (§A.4.3).
-func pdfStoreCount(ctx context.Context, data []byte) int {
+func pdfStoreCount(ctx context.Context, objs *pdfObjects) int {
+	if objs == nil {
+		return 0
+	}
 	seen := map[int]bool{}
-	for _, o := range indexPDFObjects(ctx, data).order {
+	for _, o := range objs.order {
 		if ctx.Err() != nil {
 			return len(seen)
 		}

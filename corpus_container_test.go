@@ -124,14 +124,17 @@ func assembleAsset(container Container, store []byte) (asset []byte, exclStart, 
 // pdfProducerFraming frames the store the way an observed producer's output
 // does: a catalog at generation 1 (`5 1 obj`, `/Root 5 1 R`), /Type /FileSpec
 // rather than /Filespec, a literal-string /Subtype, and the manifest added by an
-// incremental update. Without the chain the update section omits the file
-// specification and the /AF catalog, as an object stream would hide them, and
-// the literal /Subtype on the stream is the only marker left.
+// incremental update. Without the chain no catalog is written at all, which is
+// what an object stream does to one, leaving the literal /Subtype on the stream
+// as the only marker: the markers are only consulted when nothing resolves.
 func pdfProducerFraming(chain bool) assetFraming {
 	return func(store []byte) (asset []byte, exclStart, exclLen int) {
 		asset = append(asset, "%PDF-1.7\n"...)
 		asset = append(asset, "7 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"...)
-		asset = append(asset, "5 1 obj\n<< /PageMode /UseNone /Pages 7 0 R /Type /Catalog >>\nendobj\n"...)
+		if chain {
+			asset = append(asset,
+				"5 1 obj\n<< /PageMode /UseNone /Pages 7 0 R /Type /Catalog >>\nendobj\n"...)
+		}
 		// /Prev names the base section's xref, an offset the store cannot move,
 		// so it stays length-stable across the exclusion fixpoint's passes.
 		prev := len(asset)
