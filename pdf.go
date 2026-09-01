@@ -17,19 +17,19 @@ import (
 // indirect reference to the specification containing the active manifest. The
 // stream payload is the raw JUMBF store.
 
-// This is a lexical object scanner, not a full PDF parser: it indexes the
-// `N G obj … endobj` definitions it can see, inflates the object streams among
-// them to index what those hold, and follows the chain from there. PDF 32000-1
-// §7.5.7 forbids a stream object inside an object stream but permits the file
-// specification dictionary carrying the §A.4.1 markers, so the store's bytes
-// being visible does not make the store identifiable — the chain is what does.
+// Objects are found lexically — the `N G obj … endobj` definitions visible in
+// the bytes — and the document is then resolved the way a reader resolves it:
+// cross-reference tables and streams place the objects, object streams are
+// inflated to index what they hold. PDF 32000-1 §7.5.7 forbids a stream object
+// inside an object stream but permits the file specification dictionary
+// carrying the §A.4.1 markers, so the chain is what identifies the store.
 
 // Incremental updates append rather than rewrite, so §A.4.2.1 makes the store
-// in the most recent update section the active manifest: here the last /Root
-// names the current catalog and the last definition of an object number
-// supersedes the ones before it. §A.4.2.1 also asks a consumer to process the
-// stores of ALL update sections as one; that is not done — see the fallback in
-// pdfMarkedStore for how a superseded store is still surfaced.
+// in the most recent update section the active manifest: here the newest
+// cross-reference section that places a /Root names the current catalog, and
+// the last definition of an object number supersedes the ones before it.
+// §A.4.2.1 also asks a consumer to process the stores of ALL update sections as
+// one; that is not done — see pdfMarkedStore for how a superseded store surfaces.
 
 // The names §A.4.1 gives the C2PA embedded file. The /Subtype is accepted but
 // never required: the spec puts it on the file specification dictionary while
