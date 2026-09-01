@@ -70,6 +70,44 @@ func TestPDFOpenAIFixture(t *testing.T) {
 	}
 }
 
+// TestPDFAdobeReferenceFile reads the C2PA reference PDF, which cannot live in
+// testdata: c2pa-org/public-testfiles licenses it CC-BY-SA-4.0 and this
+// repository is MIT with Apache-2.0/MIT fixtures. It is the only real producer
+// file that proves /Subtype is absent in the wild, so it is worth an opt-in
+// test — point C2PA_ADOBE_PDF at it, or have CI download it.
+func TestPDFAdobeReferenceFile(t *testing.T) {
+	path := os.Getenv("C2PA_ADOBE_PDF")
+	if path == "" {
+		t.Skip("set C2PA_ADOBE_PDF to adobe-20240110-single_manifest_store.pdf")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if !bytes.Contains(data, []byte("/AFRelationship /C2PA_Manifest")) {
+		t.Error("no /AFRelationship /C2PA_Manifest: not the reference file")
+	}
+	// The claim this pins: the markers the /Subtype fallback looks for are not
+	// in this file, on either dictionary, so that fallback is no backstop.
+	for _, subtype := range []string{"application#2Fc2pa", "(application/c2pa)"} {
+		if bytes.Contains(data, []byte(subtype)) {
+			t.Errorf("the reference file carries %s after all", subtype)
+		}
+	}
+
+	info := Read(ctx, PDF, bytes.NewReader(data))
+	if !info.Present {
+		t.Fatal("no manifest read from the reference file")
+	}
+	t.Logf("generator=%q signer=%q", info.ClaimGenerator, info.SignedBy)
+	store, resolved := pdfActiveStore(ctx, data, indexPDFObjects(ctx, data))
+	if store == nil || !resolved {
+		t.Error("the catalog chain does not resolve, so the store is unattributed")
+	}
+}
+
 // --- synthetic PDF builders --------------------------------------------------
 
 // pdfDoc assembles a PDF in memory: a header, indirect objects in the order
@@ -519,9 +557,14 @@ func TestValidatePDF_MarkerSourcedStoreIsReported(t *testing.T) {
 // of hand-broken ones. Nothing may panic, hang, or invent a manifest.
 func TestPDFJUMBF_Malformed(t *testing.T) {
 	ctx := context.Background()
-	doc := synthPDF(t, synthJUMB([]byte("manifest store")), true)
+	store := synthJUMB([]byte("manifest store"))
+	doc := synthPDF(t, store, true)
+	// A returned store must be the whole superbox: looksLikeJUMBF only accepts
+	// bytes whose declared length is present, so a truncation either finds all
+	// of it or nothing. Asserting "not a 0x00 prefix" admitted every possible
+	// return, since every superbox under 16 MiB opens with a 0x00 length byte.
 	for n := 0; n < len(doc); n++ {
-		if got := pdfJUMBF(ctx, doc[:n]); got != nil && !bytes.HasPrefix(got, []byte("\x00")) {
+		if got := pdfJUMBF(ctx, doc[:n]); got != nil && !bytes.Equal(got, store) {
 			t.Fatalf("truncated to %d bytes yielded %q", n, got)
 		}
 	}

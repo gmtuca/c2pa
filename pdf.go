@@ -580,7 +580,9 @@ func pdfStreamPayload(body []byte) (dict, payload []byte) {
 			continue // part of a longer token, e.g. `endstream`
 		}
 		dict, p := body[:start], pos
-		// The spec requires CRLF or LF (not a bare CR) after the keyword.
+		// ISO 32000 §7.3.8.1 allows only CRLF or LF after the keyword, never a
+		// bare CR. A bare CR is read anyway: producers emit it, and refusing it
+		// would lose the store over a byte no reader objects to.
 		if p >= len(body) || (body[p] != '\r' && body[p] != '\n') {
 			continue
 		}
