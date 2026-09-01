@@ -76,11 +76,17 @@ func TestPDFOpenAIFixture(t *testing.T) {
 // — the extractor is a lexical scanner, and what these tests exercise is the
 // object bytes. Appending more objects and a second trailer after a first one
 // is exactly the shape of a PDF incremental update.
-type pdfDoc struct{ b []byte }
+type pdfDoc struct {
+	b []byte
+	// offs records where each object number's definition starts, which is what
+	// a cross-reference table holds; xrefTrailer needs it.
+	offs map[int]int
+}
 
-func newPDFDoc() *pdfDoc { return &pdfDoc{b: []byte("%PDF-1.7\n")} }
+func newPDFDoc() *pdfDoc { return &pdfDoc{b: []byte("%PDF-1.7\n"), offs: map[int]int{}} }
 
 func (d *pdfDoc) obj(num int, body string) *pdfDoc {
+	d.offs[num] = len(d.b)
 	d.b = append(d.b, fmt.Sprintf("%d 0 obj\n%s\nendobj\n", num, body)...)
 	return d
 }
@@ -91,6 +97,7 @@ func (d *pdfDoc) stream(num int, dict string, payload []byte, length string) *pd
 	if length == "" {
 		length = fmt.Sprint(len(payload))
 	}
+	d.offs[num] = len(d.b)
 	d.b = append(d.b, fmt.Sprintf("%d 0 obj\n<< %s /Length %s >>\nstream\n", num, dict, length)...)
 	d.b = append(d.b, payload...)
 	d.b = append(d.b, "\nendstream\nendobj\n"...)
@@ -102,11 +109,47 @@ func (d *pdfDoc) trailer(root int) *pdfDoc {
 	return d
 }
 
+// xrefTrailer writes a real cross-reference table over every object appended so
+// far and a startxref holding that table's own offset — the route a conforming
+// reader takes to the catalog. trailer() writes a startxref of 0, which no
+// reader can follow, so only a document ending here exercises the xref path.
+func (d *pdfDoc) xrefTrailer(root int) *pdfDoc {
+	high := 0
+	for num := range d.offs {
+		high = max(high, num)
+	}
+	start := len(d.b)
+	d.b = append(d.b, fmt.Sprintf("xref\n0 %d\n0000000000 65535 f \n", high+1)...)
+	for num := 1; num <= high; num++ {
+		if off, ok := d.offs[num]; ok {
+			d.b = append(d.b, fmt.Sprintf("%010d 00000 n \n", off)...)
+		} else {
+			d.b = append(d.b, "0000000000 65535 f \n"...)
+		}
+	}
+	d.b = append(d.b, fmt.Sprintf("trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%d\n%%%%EOF\n",
+		high+1, root, start)...)
+	return d
+}
+
 func (d *pdfDoc) bytes() []byte { return d.b }
+
+// append adds raw bytes with no cross-reference entry of their own, which is
+// what tampering after %%EOF looks like.
+func (d *pdfDoc) append(s string) *pdfDoc {
+	d.b = append(d.b, s...)
+	return d
+}
 
 // clone copies the document, so an update section can be appended to a fresh
 // copy without disturbing the bytes of the original.
-func (d *pdfDoc) clone() *pdfDoc { return &pdfDoc{b: append([]byte{}, d.b...)} }
+func (d *pdfDoc) clone() *pdfDoc {
+	c := &pdfDoc{b: append([]byte{}, d.b...), offs: map[int]int{}}
+	for num, off := range d.offs {
+		c.offs[num] = off
+	}
+	return c
+}
 
 const (
 	pdfEmbeddedFileDict = "/Type /EmbeddedFile /Subtype /application#2Fc2pa"
@@ -288,6 +331,60 @@ func TestPDFJUMBF_IncrementalUpdate(t *testing.T) {
 			trailer(1).bytes()
 		if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, first) {
 			t.Fatalf("got %q want the earlier update's manifest", got)
+		}
+	})
+}
+
+// pdfEmptyJUMB is a well-formed superbox carrying no manifest: the payload a
+// decoy catalog points at to make a signed document read as unsigned.
+var pdfEmptyJUMB = []byte{0, 0, 0, 8, 'j', 'u', 'm', 'b'}
+
+// TestPDFJUMBF_AuthoritativeCatalog pins that only the cross-reference section
+// the last startxref names can say which object is the catalog. Taking the last
+// /Root, or the last lexical definition of an object number, lets bytes no
+// reader treats as part of the document redirect it — and a decoy pointing at an
+// empty superbox turns a signed manifest into an absent one, which costs no
+// cryptography and reads as "no provenance" rather than as tampering.
+func TestPDFJUMBF_AuthoritativeCatalog(t *testing.T) {
+	store := synthJUMB([]byte("manifest store"))
+	ctx := context.Background()
+
+	genuine := newPDFDoc().
+		obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>").
+		obj(2, "<< /Type /Pages /Kids [] /Count 0 >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, store, "").
+		xrefTrailer(1)
+	if got := pdfJUMBF(ctx, genuine.bytes()); !bytes.Equal(got, store) {
+		t.Fatalf("genuine document: got %q want the store", got)
+	}
+
+	decoy := fmt.Sprintf("900 0 obj\n<< /Type /Catalog /AF [901 0 R] >>\nendobj\n"+
+		"901 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest"+
+		" /EF << /F 902 0 R >> >>\nendobj\n"+
+		"902 0 obj\n<< /Type /EmbeddedFile /Length %d >>\nstream\n%s\nendstream\nendobj\n",
+		len(pdfEmptyJUMB), pdfEmptyJUMB)
+
+	t.Run("trailer appended after EOF", func(t *testing.T) {
+		// No cross-reference section of its own, so startxref still names the
+		// genuine table and these bytes are not part of the document.
+		tampered := genuine.clone().
+			append(decoy + "trailer\n<< /Size 903 /Root 900 0 R >>\n").bytes()
+		t.Logf("%d bytes appended", len(tampered)-len(genuine.bytes()))
+		if got := pdfJUMBF(ctx, tampered); !bytes.Equal(got, store) {
+			t.Fatalf("appended decoy catalog won: got %q want the genuine store", got)
+		}
+	})
+
+	t.Run("phantom catalog redefining the object", func(t *testing.T) {
+		// The decoy redefines object 1 rather than naming a new one, so it needs
+		// no /Root of its own: the lexical "last definition wins" rule hands it
+		// the document.
+		tampered := genuine.clone().
+			append("1 0 obj\n<< /Type /Catalog /AF [901 0 R] >>\nendobj\n" +
+				decoy).bytes()
+		if got := pdfJUMBF(ctx, tampered); !bytes.Equal(got, store) {
+			t.Fatalf("phantom catalog won: got %q want the genuine store", got)
 		}
 	})
 }

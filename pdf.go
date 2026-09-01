@@ -71,11 +71,17 @@ const maxPDFDictScan = 2048
 // the rest of the file once per copy.
 const maxPDFStoreAttempts = 32
 
+// maxPDFXrefHops bounds the /Prev chain followed looking for a trailer that
+// names /Root. Real documents name it in the newest trailer.
+const maxPDFXrefHops = 32
+
 // pdfObject is one `N G obj … endobj` definition. body is a subslice of the
 // asset bytes running from just past the `obj` keyword to `endobj`, so a
-// stream's payload stays addressable.
+// stream's payload stays addressable. hdr is where the definition starts, which
+// is what a cross-reference entry holds.
 type pdfObject struct {
 	num  int
+	hdr  int
 	body []byte
 }
 
@@ -92,6 +98,35 @@ type pdfObjects struct {
 func (o *pdfObjects) body(num int) []byte {
 	if i, ok := o.newest[num]; ok {
 		return o.order[i].body
+	}
+	return nil
+}
+
+// catalog returns the document catalog's body. A non-zero off is the offset the
+// cross-reference section gave for it, and is authoritative: it is the only way
+// to tell the real definition from a phantom `N G obj` in a content stream.
+// Without one, the newest definition that /Type says is a catalog stands.
+func (o *pdfObjects) catalog(num, off int) []byte {
+	for i := range o.order {
+		if off > 0 && o.order[i].hdr == off && o.order[i].num == num {
+			return pdfIfCatalog(o.order[i].body)
+		}
+	}
+	for i := len(o.order) - 1; i >= 0; i-- {
+		if o.order[i].num == num {
+			if body := pdfIfCatalog(o.order[i].body); body != nil {
+				return body
+			}
+		}
+	}
+	return nil
+}
+
+// pdfIfCatalog returns body when it is a document catalog, which ISO 32000
+// §7.7.2 requires /Type /Catalog to say.
+func pdfIfCatalog(body []byte) []byte {
+	if pdfName(pdfDict(body), "Type") == "Catalog" {
+		return body
 	}
 	return nil
 }
@@ -131,7 +166,7 @@ func indexPDFObjects(ctx context.Context, data []byte) *pdfObjects {
 		}
 		pos := i + k
 		i = pos + len("obj")
-		num, ok := pdfObjNumber(data, pos)
+		num, hdr, ok := pdfObjNumber(data, pos)
 		if !ok {
 			continue
 		}
@@ -143,39 +178,40 @@ func indexPDFObjects(ctx context.Context, data []byte) *pdfObjects {
 			}
 		}
 		objs.newest[num] = len(objs.order)
-		objs.order = append(objs.order, pdfObject{num: num, body: data[i:endobj]})
+		objs.order = append(objs.order, pdfObject{num: num, hdr: hdr, body: data[i:endobj]})
 	}
 	return objs
 }
 
-// pdfObjNumber parses the `N G obj` header whose `obj` keyword starts at pos.
-// It insists on the whole token shape — digits, space, digits, space, `obj`,
-// delimiter — so neither the `obj` inside `endobj` nor a chance occurrence in
-// stream bytes indexes a phantom object.
-func pdfObjNumber(data []byte, pos int) (int, bool) {
+// pdfObjNumber parses the `N G obj` header whose `obj` keyword starts at pos,
+// returning the object number and where the header starts. It insists on the
+// whole token shape — digits, space, digits, space, `obj`, delimiter — so
+// neither the `obj` inside `endobj` nor a chance occurrence in stream bytes
+// indexes a phantom object.
+func pdfObjNumber(data []byte, pos int) (num, hdr int, ok bool) {
 	if p := pos + len("obj"); p < len(data) && !pdfIsSpace(data[p]) && !pdfIsDelim(data[p]) {
-		return 0, false
+		return 0, 0, false
 	}
 	i := pdfSkipSpaceBack(data, pos)
 	if i == pos {
-		return 0, false
+		return 0, 0, false
 	}
-	_, i, ok := pdfUintBack(data, i) // generation number
+	_, i, ok = pdfUintBack(data, i) // generation number
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 	j := pdfSkipSpaceBack(data, i)
 	if j == i {
-		return 0, false
+		return 0, 0, false
 	}
-	num, j, ok := pdfUintBack(data, j)
+	num, j, ok = pdfUintBack(data, j)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 	if j > 0 && !pdfIsSpace(data[j-1]) && !pdfIsDelim(data[j-1]) {
-		return 0, false
+		return 0, 0, false
 	}
-	return num, true
+	return num, j, true
 }
 
 // pdfActiveStore returns the active manifest by the route §A.4.2.1 defines: the
@@ -185,11 +221,13 @@ func pdfObjNumber(data []byte, pos int) (int, bool) {
 // no /Root, or a catalog or file specification compressed into an object
 // stream.
 func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) []byte {
-	root, ok := pdfRootLexical(ctx, data)
+	root, off, ok := pdfXrefRoot(ctx, data)
 	if !ok {
-		return nil
+		if root, ok = pdfRootLexical(ctx, data); !ok {
+			return nil
+		}
 	}
-	catalog := objs.body(root)
+	catalog := objs.catalog(root, off)
 	if catalog == nil {
 		return nil
 	}
@@ -405,6 +443,91 @@ func pdfInflate(raw []byte, limit int) []byte {
 func pdfDrain(r io.Reader, limit int) []byte {
 	out, _ := io.ReadAll(io.LimitReader(r, int64(limit)))
 	return out
+}
+
+// pdfXrefRoot resolves the catalog the way a conforming reader does: the last
+// startxref gives the offset of the current cross-reference section, whose
+// trailer names /Root. off is where that section says the catalog lives, 0 when
+// it does not spell an offset out. Bytes appended after %%EOF carry no section
+// of their own, so they cannot redirect the document.
+func pdfXrefRoot(ctx context.Context, data []byte) (root, off int, ok bool) {
+	p := bytes.LastIndex(data, []byte("startxref"))
+	if p < 0 {
+		return 0, 0, false
+	}
+	pos, _, ok := pdfUint(data, pdfSkipSpace(data, p+len("startxref")), len(data))
+	if !ok {
+		return 0, 0, false
+	}
+	for hop := 0; hop < maxPDFXrefHops; hop++ {
+		if ctx.Err() != nil || pos <= 0 || pos >= len(data) {
+			return 0, 0, false
+		}
+		trailer, offsets := pdfXrefSection(data, pos)
+		if trailer == nil {
+			return 0, 0, false
+		}
+		if refs := pdfRefs(trailer, "Root", 1); len(refs) == 1 {
+			return refs[0], offsets[refs[0]], true
+		}
+		if pos, ok = pdfInt(trailer, "Prev"); !ok {
+			return 0, 0, false
+		}
+	}
+	return 0, 0, false
+}
+
+// pdfXrefSection returns the trailer dictionary of the cross-reference section
+// at pos, plus each in-use object's offset when it is a classic table. An xref
+// stream keeps the trailer entries in its own object dictionary and its offsets
+// in a compressed payload, so only the dictionary is read.
+func pdfXrefSection(data []byte, pos int) ([]byte, map[int]int) {
+	p := pdfSkipSpace(data, pos)
+	if bytes.HasPrefix(data[p:], []byte("xref")) {
+		return pdfClassicXref(data, p+len("xref"))
+	}
+	if k := bytes.Index(data[p:min(len(data), p+maxPDFDictScan)], []byte("obj")); k >= 0 {
+		return pdfDict(data[p+k+len("obj"):]), nil
+	}
+	return nil, nil
+}
+
+// pdfClassicXref reads a cross-reference table's subsections and the trailer
+// that follows them, collecting the byte offset of every in-use entry.
+func pdfClassicXref(data []byte, p int) ([]byte, map[int]int) {
+	offsets := map[int]int{}
+	for len(offsets) <= maxPDFObjects {
+		p = pdfSkipSpace(data, p)
+		if bytes.HasPrefix(data[p:], []byte("trailer")) {
+			return pdfDict(data[p+len("trailer"):]), offsets
+		}
+		first, q, ok := pdfUint(data, p, len(data))
+		if !ok {
+			return nil, nil
+		}
+		count, q, ok := pdfUint(data, pdfSkipSpace(data, q), len(data))
+		if !ok || count > maxPDFObjects {
+			return nil, nil
+		}
+		for i := 0; i < count; i++ {
+			var entry int
+			if entry, q, ok = pdfUint(data, pdfSkipSpace(data, q), len(data)); !ok {
+				return nil, nil
+			}
+			if _, q, ok = pdfUint(data, pdfSkipSpace(data, q), len(data)); !ok {
+				return nil, nil
+			}
+			if q = pdfSkipSpace(data, q); q >= len(data) {
+				return nil, nil
+			}
+			if data[q] == 'n' {
+				offsets[first+i] = entry
+			}
+			q++
+		}
+		p = q
+	}
+	return nil, nil
 }
 
 // pdfRootLexical returns the object number of the document catalog by scanning
