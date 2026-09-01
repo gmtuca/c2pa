@@ -420,6 +420,18 @@ func TestPDFJUMBF_AuthoritativeCatalog(t *testing.T) {
 		}
 	})
 
+	t.Run("startxref appended after EOF", func(t *testing.T) {
+		// The decoy brings its own startxref, so the last one in the file no
+		// longer names the genuine table. Taking only the last leaves the
+		// document with no section that places a /Root, and the genuine store is
+		// then never reached.
+		tampered := genuine.clone().
+			append(decoy + "trailer\n<< /Size 903 /Root 900 0 R >>\nstartxref\n0\n%%EOF\n").bytes()
+		if got := pdfJUMBF(ctx, tampered); !bytes.Equal(got, store) {
+			t.Fatalf("appended startxref won: got %q want the genuine store", got)
+		}
+	})
+
 	t.Run("phantom catalog redefining the object", func(t *testing.T) {
 		// The decoy redefines object 1 rather than naming a new one, so it needs
 		// no /Root of its own: the lexical "last definition wins" rule hands it

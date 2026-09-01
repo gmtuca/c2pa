@@ -80,6 +80,11 @@ const maxPDFStoreAttempts = 32
 // names /Root. Real documents name it in the newest trailer.
 const maxPDFXrefHops = 32
 
+// maxPDFXrefStarts bounds how many startxref keywords are tried, newest first,
+// looking for one whose section places a /Root. A conforming document needs the
+// first; the rest are for one with junk appended after %%EOF.
+const maxPDFXrefStarts = 8
+
 // maxPDFObjectStreams caps how many object streams are inflated to index what
 // they hold, so a document full of them cannot spend the whole decompression
 // budget on the object index alone.
@@ -826,27 +831,46 @@ func pdfDrain(r io.Reader, limit int) []byte {
 	return out
 }
 
-// pdfXrefRoot resolves the catalog the way a conforming reader does: the last
-// startxref gives the offset of the current cross-reference section, whose
-// trailer names /Root. off is where that section says the catalog lives, 0 when
-// it does not spell an offset out. Bytes appended after %%EOF carry no section
-// of their own, so they cannot redirect the document.
+// pdfXrefRoot resolves the catalog the way a conforming reader does: a startxref
+// gives the offset of a cross-reference section, whose trailer names /Root. The
+// last one is tried first and an earlier one only when its section places no
+// /Root at all, so junk appended after %%EOF cannot hide the genuine table by
+// bringing a startxref of its own. loc is where that section says the catalog
+// lives, zero when it does not place it.
 func pdfXrefRoot(
 	ctx context.Context,
 	data []byte,
 	objs *pdfObjects,
 ) (root int, loc pdfXrefLoc, ok bool) {
-	p := bytes.LastIndex(data, []byte("startxref"))
-	if p < 0 {
-		return 0, loc, false
+	end := len(data)
+	for tries := 0; tries < maxPDFXrefStarts; tries++ {
+		p := bytes.LastIndex(data[:end], []byte("startxref"))
+		if p < 0 {
+			break
+		}
+		end = p
+		pos, _, spelled := pdfUint(data, pdfSkipSpace(data, p+len("startxref")), len(data))
+		if !spelled {
+			continue
+		}
+		if root, loc, ok = pdfXrefChain(ctx, data, objs, pos); ok {
+			return root, loc, true
+		}
 	}
-	pos, _, ok := pdfUint(data, pdfSkipSpace(data, p+len("startxref")), len(data))
-	if !ok {
-		return 0, loc, false
-	}
-	// The whole chain is walked, not just the section naming /Root: an object
-	// the newest update did not touch is placed by an older section. Earlier
-	// sections never overwrite what a newer one already said.
+	return 0, pdfXrefLoc{}, false
+}
+
+// pdfXrefChain walks the /Prev chain from the section at pos and returns the
+// /Root it names. The whole chain is walked, not just the section naming /Root:
+// an object the newest update did not touch is placed by an older section.
+// Earlier sections never overwrite what a newer one already said, and each
+// candidate startxref gets its own placements so a decoy cannot seed them.
+func pdfXrefChain(
+	ctx context.Context,
+	data []byte,
+	objs *pdfObjects,
+	pos int,
+) (root int, loc pdfXrefLoc, ok bool) {
 	locs, found := map[int]pdfXrefLoc{}, false
 	for hop := 0; hop < maxPDFXrefHops; hop++ {
 		if ctx.Err() != nil || pos <= 0 || pos >= len(data) {
