@@ -8,8 +8,8 @@
 **Website:** [richardwooding.github.io/c2pa](https://richardwooding.github.io/c2pa/)
 
 A small, **pure-Go** (no cgo) library for [C2PA / Content Credentials](https://c2pa.org)
-provenance manifests embedded in **JPEG**, **PNG**, and **BMFF** (MP4, MOV, HEIC, HEIF, AVIF)
-files, with two modes:
+provenance manifests embedded in **JPEG**, **PNG**, **BMFF** (MP4, MOV, HEIC, HEIF, AVIF) and
+**PDF** files, with two modes:
 
 - **`Read`** — a fast, *unverified* reader. Surfaces what a file *claims* (creating tool, title,
   format, AI-generated flag, signer identity, signing time) like EXIF or an email `From:` header.
@@ -32,7 +32,7 @@ AI-generated assets") — not for trust decisions.
 f, _ := os.Open("photo.jpg")
 defer f.Close()
 
-info := c2pa.Read(context.Background(), c2pa.JPEG, f) // or c2pa.PNG / c2pa.BMFF
+info := c2pa.Read(context.Background(), c2pa.JPEG, f) // or c2pa.PNG / c2pa.BMFF / c2pa.PDF
 if !info.Present {
     return // no Content Credentials embedded
 }
@@ -49,6 +49,12 @@ fmt.Println(info.SignedAt)       // RFC 3161 signing time (unverified)
 `Read` is best-effort and never returns an error: a missing or malformed manifest yields
 `Info{Present: false}`. It reads at most `c2pa.MaxScan` (16 MiB) from the reader and honours the
 context — a cancelled call surrenders promptly mid-scan.
+
+For **PDF**, the manifest store is the embedded file the document catalog associates with
+`/AFRelationship /C2PA_Manifest` (spec §A.4). An incremental update appends a new store and the
+newest is the active manifest; a `/FlateDecode` stream is inflated under a bound. Stores from
+earlier update sections are surfaced only when the current catalog associates none — they are not
+merged into the active manifest as §A.4.2.1 asks.
 
 | `Info` field | Meaning |
 |---|---|
@@ -90,7 +96,7 @@ What it verifies:
 - **COSE signature** — the `COSE_Sign1` over the claim (ES256/384/512, PS256/384/512, EdDSA).
 - **Certificate chain + C2PA profile** — chains the signer to the trust list and enforces the C2PA
   certificate profile (EKU, key usage, no weak algorithms), at the verified signing time.
-- **Hash bindings** — the hard binding (`c2pa.hash.data` for JPEG/PNG, `c2pa.hash.bmff.v2`/`.v3`
+- **Hash bindings** — the hard binding (`c2pa.hash.data` for JPEG/PNG/PDF, `c2pa.hash.bmff.v2`/`.v3`
   for BMFF assets — fragmented/Merkle BMFF is reported as unsupported) and each assertion's
   `hashed_uri`.
 - **RFC 3161 timestamp** — full CMS signature verification, the TSA chain, and that the timestamp

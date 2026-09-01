@@ -204,6 +204,15 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 	if container == BMFF && bmffHasUpdateManifest(ctx, data) {
 		v.add(StatusUnsupported, "", "BMFF update manifest present but not evaluated", nil)
 	}
+	// A PDF signed more than once holds one store per update section, which
+	// spec §A.4.2.1 asks a consumer to process as a single store; only the
+	// active one is evaluated here. Object-level manifests (§A.4.3) count too.
+	if container == PDF {
+		if n := pdfStoreCount(ctx, data); n > 1 {
+			v.add(StatusUnsupported, "",
+				"PDF carries additional C2PA manifest stores that were not evaluated", nil)
+		}
+	}
 	// Reuse the read path to surface the convenience Info fields.
 	v.res.Info = parseManifest(ctx, jumbf)
 
@@ -228,6 +237,8 @@ func extractJUMBF(ctx context.Context, container Container, data []byte) []byte 
 		return pngJUMBF(ctx, data)
 	case BMFF:
 		return bmffJUMBF(ctx, data)
+	case PDF:
+		return pdfJUMBF(ctx, data)
 	default:
 		return nil
 	}

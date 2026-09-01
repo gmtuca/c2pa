@@ -2,6 +2,7 @@ package c2pa
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"testing"
 )
@@ -96,6 +97,23 @@ func assembleAsset(container Container, store []byte) (asset []byte, exclStart, 
 		exclLen = len(asset) - exclStart
 		asset = append(asset, pngChunk("IDAT", []byte{0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01})...)
 		asset = append(asset, pngChunk("IEND", nil)...)
+	case PDF:
+		// Catalog /AF → file specification → embedded file stream (spec §A.4).
+		// The exclusion covers exactly the stream payload, as Adobe's reference
+		// PDF does: the stream dictionary and its /Length stay hashed, so the
+		// store cannot be resized after signing.
+		asset = append(asset, "%PDF-1.7\n"...)
+		asset = append(asset, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>\nendobj\n"...)
+		asset = append(asset, "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"...)
+		asset = append(asset, "3 0 obj\n<< /Type /Filespec /F (c2pa.c2pa) /UF (c2pa.c2pa)"+
+			" /AFRelationship /C2PA_Manifest /EF << /F 4 0 R >> >>\nendobj\n"...)
+		asset = append(asset, fmt.Sprintf("4 0 obj\n<< /Type /EmbeddedFile"+
+			" /Subtype /application#2Fc2pa /Length %d >>\nstream\n", len(store))...)
+		exclStart = len(asset)
+		asset = append(asset, store...)
+		exclLen = len(asset) - exclStart
+		asset = append(asset, "\nendstream\nendobj\n"...)
+		asset = append(asset, "trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"...)
 	}
 	return asset, exclStart, exclLen
 }

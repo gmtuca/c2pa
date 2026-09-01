@@ -13,7 +13,8 @@ import (
 )
 
 // FuzzRead targets the full extraction pipeline: jpegJUMBF (APP11
-// marker-segment reassembly) / pngJUMBF (caBX chunk concatenation) → WalkBoxes
+// marker-segment reassembly) / pngJUMBF (caBX chunk concatenation) /
+// pdfJUMBF (indirect-object scan → embedded file stream) → WalkBoxes
 // (recursive LBox/TBox box tree) → parseManifest (CBOR claim/actions decode) →
 // signerIdentity (COSE_Sign1 → x509) → rfc3161GenTime (ASN.1 timestamp). Every
 // stage walks attacker-controlled bytes pulled from arbitrary files.
@@ -36,6 +37,13 @@ func FuzzRead(f *testing.F) {
 		0x00, 0x00, 0x00, 0x00, 'c', 'a', 'B', 'X', // len 0, type caBX
 		0x00, 0x00, 0x00, 0x00, // crc
 	})
+	// A minimal PDF: header, catalog /AF, C2PA file specification, and an
+	// embedded file stream holding one empty `jumb` box.
+	f.Add([]byte("%PDF-1.7\n" +
+		"1 0 obj\n<< /Type /Catalog /AF [3 0 R] >>\nendobj\n" +
+		"3 0 obj\n<< /AFRelationship /C2PA_Manifest /EF << /F 4 0 R >> >>\nendobj\n" +
+		"4 0 obj\n<< /Length 8 >>\nstream\n\x00\x00\x00\x08jumb\nendstream\nendobj\n" +
+		"trailer\n<< /Root 1 0 R >>\n%%EOF\n"))
 	// The real signed fixture — gives the mutator a valid manifest (claim +
 	// actions + COSE signature + RFC 3161 timestamp) to corrupt from.
 	if b, err := os.ReadFile("testdata/c2pa_signed.jpg"); err == nil {
@@ -46,6 +54,7 @@ func FuzzRead(f *testing.F) {
 		_ = Read(context.Background(), JPEG, bytes.NewReader(data))
 		_ = Read(context.Background(), PNG, bytes.NewReader(data))
 		_ = Read(context.Background(), BMFF, bytes.NewReader(data))
+		_ = Read(context.Background(), PDF, bytes.NewReader(data))
 	})
 }
 
@@ -124,6 +133,7 @@ func FuzzValidate(f *testing.F) {
 		_ = Validate(context.Background(), JPEG, bytes.NewReader(data))
 		_ = Validate(context.Background(), PNG, bytes.NewReader(data))
 		_ = Validate(context.Background(), BMFF, bytes.NewReader(data))
+		_ = Validate(context.Background(), PDF, bytes.NewReader(data))
 	})
 }
 
@@ -276,5 +286,37 @@ func FuzzBMFFHash(f *testing.F) {
 		h := sha256.New()
 		hashBMFFTopLevel(ctx, asset, top, ranges, h)
 		_ = h.Sum(nil)
+	})
+}
+
+// FuzzPDFParse targets the PDF object scan and the embedded-file walk: object
+// headers, dictionary lookups, indirect references, the /Length field against
+// the `endstream` keyword, and the bounded inflation of a /FlateDecode stream.
+//
+// Contract: never panic, never loop forever; anything returned is a JUMBF
+// superbox exactly as long as its own LBox says.
+func FuzzPDFParse(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte("%PDF-1.7\n"))
+	// Catalog → file specification → embedded file stream, the §A.4 chain.
+	f.Add([]byte("%PDF-1.7\n" +
+		"1 0 obj\n<< /Type /Catalog /AF [3 0 R] >>\nendobj\n" +
+		"3 0 obj\n<< /AFRelationship /C2PA_Manifest /EF << /F 4 0 R >> >>\nendobj\n" +
+		"4 0 obj\n<< /Length 8 >>\nstream\n\x00\x00\x00\x08jumb\nendstream\nendobj\n" +
+		"trailer\n<< /Root 1 0 R >>\n%%EOF\n"))
+	// A /Length that runs past the object, and an /AF that points at itself.
+	f.Add([]byte("%PDF-1.7\n1 0 obj\n<< /Type /Catalog /AF [1 0 R] " +
+		"/AFRelationship /C2PA_Manifest /Length 4294967295 >>\nstream\n\x00\x00\x00\x08jumb"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		store := pdfJUMBF(context.Background(), data)
+		if store == nil {
+			return
+		}
+		if len(store) < 8 || string(store[4:8]) != "jumb" {
+			t.Fatalf("returned %d bytes that are not a jumb superbox", len(store))
+		}
+		if ln := binary.BigEndian.Uint32(store[:4]); int(ln) != len(store) {
+			t.Fatalf("returned %d bytes for an LBox of %d", len(store), ln)
+		}
 	})
 }

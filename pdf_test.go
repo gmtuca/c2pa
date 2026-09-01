@@ -1,0 +1,383 @@
+package c2pa
+
+import (
+	"bytes"
+	"compress/zlib"
+	"context"
+	"fmt"
+	"os"
+	"testing"
+)
+
+// --- synthetic PDF builders --------------------------------------------------
+
+// pdfDoc assembles a PDF in memory: a header, indirect objects in the order
+// they are appended, and a trailer naming the catalog. It writes no xref table
+// — the extractor is a lexical scanner, and what these tests exercise is the
+// object bytes. Appending more objects and a second trailer after a first one
+// is exactly the shape of a PDF incremental update.
+type pdfDoc struct{ b []byte }
+
+func newPDFDoc() *pdfDoc { return &pdfDoc{b: []byte("%PDF-1.7\n")} }
+
+func (d *pdfDoc) obj(num int, body string) *pdfDoc {
+	d.b = append(d.b, fmt.Sprintf("%d 0 obj\n%s\nendobj\n", num, body)...)
+	return d
+}
+
+// stream appends a stream object. length is the literal text of the /Length
+// entry, so a test can make it lie or make it indirect; "" writes the truth.
+func (d *pdfDoc) stream(num int, dict string, payload []byte, length string) *pdfDoc {
+	if length == "" {
+		length = fmt.Sprint(len(payload))
+	}
+	d.b = append(d.b, fmt.Sprintf("%d 0 obj\n<< %s /Length %s >>\nstream\n", num, dict, length)...)
+	d.b = append(d.b, payload...)
+	d.b = append(d.b, "\nendstream\nendobj\n"...)
+	return d
+}
+
+func (d *pdfDoc) trailer(root int) *pdfDoc {
+	d.b = append(d.b, fmt.Sprintf("trailer\n<< /Root %d 0 R >>\nstartxref\n0\n%%%%EOF\n", root)...)
+	return d
+}
+
+func (d *pdfDoc) bytes() []byte { return d.b }
+
+// clone copies the document, so an update section can be appended to a fresh
+// copy without disturbing the bytes of the original.
+func (d *pdfDoc) clone() *pdfDoc { return &pdfDoc{b: append([]byte{}, d.b...)} }
+
+const (
+	pdfEmbeddedFileDict = "/Type /EmbeddedFile /Subtype /application#2Fc2pa"
+	pdfC2PAFilespec     = "<< /Type /Filespec /F (c2pa.c2pa) /UF (c2pa.c2pa) " +
+		"/AFRelationship /C2PA_Manifest /EF << /F 4 0 R >> >>"
+)
+
+// synthPDF builds a document whose catalog associates one C2PA manifest, the
+// layout spec §A.4 describes: catalog /AF → file specification → /EF stream.
+func synthPDF(t *testing.T, store []byte, compress bool) []byte {
+	t.Helper()
+	dict, payload := pdfEmbeddedFileDict, store
+	if compress {
+		dict, payload = dict+" /Filter /FlateDecode", zlibBytes(t, store)
+	}
+	return newPDFDoc().
+		obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>").
+		obj(2, "<< /Type /Pages /Kids [] /Count 0 >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, dict, payload, "").
+		trailer(1).
+		bytes()
+}
+
+// zlibBytes compresses b the way a producer writes a /FlateDecode stream.
+func zlibBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// --- manifest extraction -----------------------------------------------------
+
+func TestPDFJUMBF(t *testing.T) {
+	store := synthJUMB([]byte("manifest store"))
+	ctx := context.Background()
+
+	t.Run("uncompressed embedded file", func(t *testing.T) {
+		if got := pdfJUMBF(ctx, synthPDF(t, store, false)); !bytes.Equal(got, store) {
+			t.Fatalf("store not extracted: got %q", got)
+		}
+	})
+	t.Run("flate-compressed embedded file", func(t *testing.T) {
+		if got := pdfJUMBF(ctx, synthPDF(t, store, true)); !bytes.Equal(got, store) {
+			t.Fatalf("compressed store not inflated: got %q", got)
+		}
+	})
+	t.Run("padded stream trimmed to the superbox", func(t *testing.T) {
+		padded := append(append([]byte{}, store...), make([]byte, 64)...)
+		if got := pdfJUMBF(ctx, synthPDF(t, padded, false)); !bytes.Equal(got, store) {
+			t.Fatalf("padding not trimmed: got %d bytes, want %d", len(got), len(store))
+		}
+	})
+	t.Run("no associated files", func(t *testing.T) {
+		doc := newPDFDoc().obj(1, "<< /Type /Catalog /Pages 2 0 R >>").trailer(1).bytes()
+		if got := pdfJUMBF(ctx, doc); got != nil {
+			t.Fatalf("document with no manifest yielded %q", got)
+		}
+	})
+	t.Run("foreign relationship ignored", func(t *testing.T) {
+		doc := newPDFDoc().
+			obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+			obj(3, "<< /Type /Filespec /F (notes.txt) /AFRelationship /Supplement /EF << /F 4 0 R >> >>").
+			stream(4, "/Type /EmbeddedFile", store, "").
+			trailer(1).bytes()
+		if got := pdfJUMBF(ctx, doc); got != nil {
+			t.Fatalf("non-C2PA associated file yielded %q", got)
+		}
+	})
+	t.Run("payload that is not JUMBF", func(t *testing.T) {
+		if got := pdfJUMBF(ctx, synthPDF(t, []byte("not a manifest at all"), false)); got != nil {
+			t.Fatalf("non-JUMBF payload yielded %q", got)
+		}
+	})
+	t.Run("not a PDF", func(t *testing.T) {
+		if got := pdfJUMBF(ctx, []byte("\x89PNG\r\n\x1a\n1 0 obj stream")); got != nil {
+			t.Fatalf("non-PDF input yielded %q", got)
+		}
+	})
+	t.Run("cancelled context", func(t *testing.T) {
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		if got := pdfJUMBF(cancelled, synthPDF(t, store, false)); got != nil {
+			t.Fatalf("cancelled ctx yielded %q", got)
+		}
+	})
+}
+
+// TestPDFJUMBF_DeclaredLengthLies pins that /Length is a hint: too large, too
+// small, or an indirect reference the scanner does not resolve, the payload is
+// still bounded by the `endstream` keyword.
+func TestPDFJUMBF_DeclaredLengthLies(t *testing.T) {
+	store := synthJUMB([]byte("manifest store"))
+	for name, length := range map[string]string{
+		"far too large": "999999999",
+		"too small":     "3",
+		"negative":      "-40",
+		"indirect ref":  "9 0 R",
+	} {
+		t.Run(name, func(t *testing.T) {
+			doc := newPDFDoc().
+				obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+				obj(3, pdfC2PAFilespec).
+				stream(4, pdfEmbeddedFileDict, store, length).
+				trailer(1).bytes()
+			if got := pdfJUMBF(context.Background(), doc); !bytes.Equal(got, store) {
+				t.Fatalf("/Length %s: got %q want the store", length, got)
+			}
+		})
+	}
+}
+
+// TestPDFJUMBF_IncrementalUpdate pins the "last definition wins" rule: an
+// update appends a new catalog and a new manifest without touching the original
+// bytes, and the newest association is the current one.
+func TestPDFJUMBF_IncrementalUpdate(t *testing.T) {
+	first := synthJUMB([]byte("first manifest"))
+	second := synthJUMB([]byte("second manifest"))
+	ctx := context.Background()
+
+	base := newPDFDoc().
+		obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>").
+		obj(2, "<< /Type /Pages /Kids [] /Count 0 >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, first, "").
+		trailer(1)
+	if got := pdfJUMBF(ctx, base.bytes()); !bytes.Equal(got, first) {
+		t.Fatalf("base document: got %q want the first manifest", got)
+	}
+
+	t.Run("re-signed", func(t *testing.T) {
+		doc := base.clone().
+			obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [5 0 R] >>").
+			obj(5, "<< /Type /Filespec /F (c2pa.c2pa) /AFRelationship /C2PA_Manifest /EF << /F 6 0 R >> >>").
+			stream(6, pdfEmbeddedFileDict, second, "").
+			trailer(1).bytes()
+		if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, second) {
+			t.Fatalf("got %q want the manifest the update associated", got)
+		}
+	})
+	t.Run("association dropped by the update", func(t *testing.T) {
+		// The newest catalog associates no C2PA manifest, but §15.5.2.2 keeps a
+		// store from an earlier update section valid, so the first one stands.
+		doc := base.clone().
+			obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [5 0 R] >>").
+			obj(5, "<< /Type /Filespec /F (notes.txt) /AFRelationship /Supplement >>").
+			trailer(1).bytes()
+		if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, first) {
+			t.Fatalf("got %q want the earlier update's manifest", got)
+		}
+	})
+}
+
+// TestPDFJUMBF_MarkerFallback covers the documents whose pointer chain is not
+// visible to a lexical scan — a catalog or file specification compressed into an
+// object stream. The embedded file stream itself always is, so the extractor
+// falls back to the spec's own markers on it.
+func TestPDFJUMBF_MarkerFallback(t *testing.T) {
+	store := synthJUMB([]byte("manifest store"))
+	ctx := context.Background()
+
+	t.Run("catalog not visible", func(t *testing.T) {
+		// /Root names an object that is not in the plain object bytes.
+		doc := newPDFDoc().
+			obj(3, pdfC2PAFilespec).
+			stream(4, pdfEmbeddedFileDict, store, "").
+			trailer(1).bytes()
+		if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, store) {
+			t.Fatalf("relationship fallback failed: got %q", got)
+		}
+	})
+	t.Run("only the embedded file visible", func(t *testing.T) {
+		doc := newPDFDoc().
+			stream(4, pdfEmbeddedFileDict, store, "").
+			trailer(1).bytes()
+		if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, store) {
+			t.Fatalf("/Subtype fallback failed: got %q", got)
+		}
+	})
+	t.Run("unmarked embedded file is not assumed", func(t *testing.T) {
+		doc := newPDFDoc().
+			stream(4, "/Type /EmbeddedFile /Subtype /text#2Fplain", store, "").
+			trailer(1).bytes()
+		if got := pdfJUMBF(ctx, doc); got != nil {
+			t.Fatalf("unmarked embedded file yielded %q", got)
+		}
+	})
+}
+
+// TestPDFJUMBF_Malformed feeds every truncation of a good document plus a set
+// of hand-broken ones. Nothing may panic, hang, or invent a manifest.
+func TestPDFJUMBF_Malformed(t *testing.T) {
+	ctx := context.Background()
+	doc := synthPDF(t, synthJUMB([]byte("manifest store")), true)
+	for n := 0; n < len(doc); n++ {
+		if got := pdfJUMBF(ctx, doc[:n]); got != nil && !bytes.HasPrefix(got, []byte("\x00")) {
+			t.Fatalf("truncated to %d bytes yielded %q", n, got)
+		}
+	}
+
+	for name, broken := range map[string][]byte{
+		"header only":          []byte("%PDF-1.7\n"),
+		"unterminated object":  []byte("%PDF-1.7\n1 0 obj\n<< /Type /Catalog /AF [3 0 R] >>"),
+		"stream never ends":    []byte("%PDF-1.7\n4 0 obj\n<< /Subtype /application#2Fc2pa /Length 8 >>\nstream\n"),
+		"self-referential AF":  []byte("%PDF-1.7\n1 0 obj\n<< /Type /Catalog /AF [1 0 R] >>\nendobj\ntrailer\n<< /Root 1 0 R >>"),
+		"absurd object number": []byte("%PDF-1.7\n99999999999999999999 0 obj\n<< /AFRelationship /C2PA_Manifest >>\nendobj\n"),
+		"garbage flate":        []byte("%PDF-1.7\n4 0 obj\n<< /Subtype /application#2Fc2pa /Filter /FlateDecode /Length 4 >>\nstream\n\xff\xff\xff\xff\nendstream\nendobj\n"),
+	} {
+		if got := pdfJUMBF(ctx, broken); got != nil {
+			t.Errorf("%s: yielded %q", name, got)
+		}
+	}
+}
+
+// TestPDFJUMBF_PathologicalCost pins the bounds that keep the scan linear. An
+// object header with no `endobj` runs its body to the end of the file, and a
+// repeated marker offers a fresh candidate stream per copy; unbounded, either
+// would cost a full scan per object. The test only has to finish.
+func TestPDFJUMBF_PathologicalCost(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("headers with no endobj", func(t *testing.T) {
+		doc := append([]byte("%PDF-1.7\n"), bytes.Repeat([]byte("1 0 obj\n"), 100_000)...)
+		doc = append(doc, bytes.Repeat([]byte{0xAB}, 1<<20)...)
+		if got := pdfJUMBF(ctx, doc); got != nil {
+			t.Fatalf("yielded %d bytes", len(got))
+		}
+	})
+	t.Run("repeated marker, no endstream", func(t *testing.T) {
+		doc := append([]byte("%PDF-1.7\n"),
+			bytes.Repeat([]byte("1 0 obj\n<< /Subtype /application#2Fc2pa /Length 99999 >>\nstream\n"), 50_000)...)
+		if got := pdfJUMBF(ctx, doc); got != nil {
+			t.Fatalf("yielded %d bytes", len(got))
+		}
+	})
+}
+
+// TestPDFJUMBF_CompressionBomb pins that inflation is capped: a stream that
+// expands far past maxPDFInflate returns rather than exhausting memory.
+func TestPDFJUMBF_CompressionBomb(t *testing.T) {
+	bomb := zlibBytes(t, make([]byte, maxPDFInflate+(64<<20)))
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict+" /Filter /FlateDecode", bomb, "").
+		trailer(1).bytes()
+	if got := pdfJUMBF(context.Background(), doc); got != nil {
+		t.Fatalf("compression bomb yielded %d bytes", len(got))
+	}
+}
+
+// --- end to end --------------------------------------------------------------
+
+// TestReadPDF_RealManifest carries the JPEG fixture's own manifest store in a
+// synthetic PDF and reads it back, proving the PDF carrier feeds the same
+// parser: the surfaced Info must be what the JPEG yields.
+func TestReadPDF_RealManifest(t *testing.T) {
+	data, err := os.ReadFile("testdata/c2pa_signed.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	want := Read(ctx, JPEG, bytes.NewReader(data))
+	if !want.Present {
+		t.Fatal("fixture has no manifest")
+	}
+	doc := synthPDF(t, extractJUMBF(ctx, JPEG, data), true)
+	if got := Read(ctx, PDF, bytes.NewReader(doc)); got != want {
+		t.Fatalf("Read(PDF) = %+v\nwant %+v", got, want)
+	}
+}
+
+// TestValidatePDF_ReportsUnevaluatedStores pins that a document signed twice
+// says so: §A.4.2.1 asks a consumer to process every update section's store as
+// one, and only the active one is evaluated here.
+func TestValidatePDF_ReportsUnevaluatedStores(t *testing.T) {
+	pool, data := fixtureSigningPool(t)
+	ctx := context.Background()
+	store := extractJUMBF(ctx, JPEG, data)
+
+	one := synthPDF(t, store, false)
+	if n := pdfStoreCount(ctx, one); n != 1 {
+		t.Fatalf("single-store document counted %d stores", n)
+	}
+	two := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, store, "").
+		trailer(1).
+		obj(1, "<< /Type /Catalog /AF [5 0 R] >>").
+		obj(5, "<< /AFRelationship /C2PA_Manifest /EF << /F 6 0 R >> >>").
+		stream(6, pdfEmbeddedFileDict, store, "").
+		trailer(1).bytes()
+	if n := pdfStoreCount(ctx, two); n != 2 {
+		t.Fatalf("re-signed document counted %d stores, want 2", n)
+	}
+
+	r := Validate(ctx, PDF, bytes.NewReader(two), WithSigningTrust(pool))
+	if !r.Has(StatusUnsupported) {
+		t.Errorf("expected an informational status for the store not evaluated: %+v", r.Statuses)
+	}
+	if !r.Has(StatusClaimSignatureValidated) {
+		t.Errorf("active manifest's signature not validated: %+v", r.Statuses)
+	}
+}
+
+// TestValidatePDF_VerifiesSignature runs the full validator over a PDF carrying
+// the fixture's manifest. The hard binding legitimately mismatches — the
+// fixture's c2pa.hash.data exclusions describe the JPEG it was signed over, not
+// this document — so the assertion is that the signature step ran and passed.
+func TestValidatePDF_VerifiesSignature(t *testing.T) {
+	pool, data := fixtureSigningPool(t)
+	ctx := context.Background()
+	doc := synthPDF(t, extractJUMBF(ctx, JPEG, data), true)
+
+	r := Validate(ctx, PDF, bytes.NewReader(doc),
+		WithSigningTrust(pool), WithTimestampTrust(fixtureTimestampPool(t)))
+	if !r.Has(StatusClaimSignatureValidated) {
+		t.Fatalf("signature not validated through the PDF carrier: %+v", r.Statuses)
+	}
+	if r.Info.Title != "CA.jpg" {
+		t.Errorf("Info.Title = %q want CA.jpg", r.Info.Title)
+	}
+	if !r.Has(StatusAssertionDataHashMismatch) {
+		t.Errorf("expected the fixture's data hash to mismatch in a PDF: %+v", r.Statuses)
+	}
+}

@@ -60,6 +60,13 @@ const (
 	// (16 MiB) can miss a manifest box placed after a large mdat; Validate's
 	// larger cap usually will not.
 	BMFF Container = "bmff"
+	// PDF reads the manifest from the embedded file the document catalog
+	// associates with the relationship /C2PA_Manifest (spec §A.4). An
+	// incremental update appends a new store and the newest is the active one.
+	// Note that Read's MaxScan (16 MiB) can miss the store in a large document,
+	// since the embedded file sits wherever the producer appended it; Validate's
+	// larger cap usually will not.
+	PDF Container = "pdf"
 )
 
 // Info is the surfaced, CLAIMED, UNVERIFIED subset of a C2PA manifest. See the
@@ -127,6 +134,8 @@ func Read(ctx context.Context, container Container, r io.Reader) Info {
 		jumbf = pngJUMBF(ctx, data)
 	case BMFF:
 		jumbf = bmffJUMBF(ctx, data)
+	case PDF:
+		jumbf = pdfJUMBF(ctx, data)
 	default:
 		return Info{}
 	}
