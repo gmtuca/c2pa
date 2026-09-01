@@ -29,7 +29,9 @@ Public surface:
 - `Validate` / `ValidationResult` / `StatusEntry` / `StatusCode` / `Severity` — the verifier and its
   result. `ValidateOption` (`WithSigningTrust`, `WithTimestampTrust`, `WithOnlineRevocation`,
   `WithClock`, `WithMaxIngredientDepth`, `WithMaxScan`, `WithHTTPClient`).
-- `WalkBoxes(ctx, jumbf, fn)` — lower-level JUMBF box-tree walker.
+- `ExtractStore(ctx, container, r)` — the raw JUMBF store as embedded; nil means none found.
+- `WalkBoxes(ctx, jumbf, fn)` — lower-level JUMBF box-tree walker. Paired with ExtractStore
+  this is what a manifest viewer uses to show assertions `Info` doesn't model.
 - `MaxScan` (Read's 16 MiB cap) / `ValidateMaxScan` (Validate's larger cap).
 
 ## Commands

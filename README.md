@@ -138,9 +138,17 @@ each `StatusEntry` has a `Severity` (success / informational / failure).
 
 ## Lower-level
 
-`c2pa.WalkBoxes(ctx, jumbf, fn)` exposes the JUMBF box-tree walker for callers that want to surface
-assertions `Read` doesn't model. Box nesting is depth-capped so adversarial input can't exhaust the
-stack.
+`c2pa.ExtractStore(ctx, container, r)` returns the raw JUMBF manifest store exactly as it appears in
+the file, and `c2pa.WalkBoxes(ctx, jumbf, fn)` walks its box tree. Together they reach assertions
+`Read` doesn't model — the pair a manifest viewer wants. A nil store means none was found, not an
+error. Box nesting is depth-capped so adversarial input can't exhaust the stack.
+
+```go
+store, err := c2pa.ExtractStore(ctx, c2pa.JPEG, file)
+c2pa.WalkBoxes(ctx, store, func(label, tbox string, content []byte) {
+    fmt.Printf("%s %s %d bytes\n", label, tbox, len(content))
+})
+```
 
 ## Requirements
 

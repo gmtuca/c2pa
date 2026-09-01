@@ -443,6 +443,27 @@ func rfc3161GenTime(der []byte) time.Time {
 // goroutine stack. We degrade gracefully (stop descending) instead.
 const maxJUMBFDepth = 64
 
+// ExtractStore returns the raw JUMBF manifest store embedded in r, byte for
+// byte as it appears in the file, or nil when the container carries none.
+//
+// It is the byte-level counterpart to Read: WalkBoxes over the result reaches
+// boxes and assertions Info does not model, which is what a manifest viewer
+// needs. Reading is capped at MaxScan, as in Read. A nil store is "none found",
+// not a failure — err is non-nil only when r itself errors.
+func ExtractStore(ctx context.Context, container Container, r io.Reader) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(r, MaxScan))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	return extractJUMBF(ctx, container, data), nil
+}
+
 // WalkBoxes recursively walks a JUMBF box tree, invoking fn(label, tbox,
 // content) for every leaf box. label is the nearest enclosing superbox's jumd
 // label, tbox is the 4-character box type, and content is the box payload.
