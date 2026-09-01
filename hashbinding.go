@@ -50,8 +50,8 @@ func (v *validator) verifyAssertionHashes(m *parsedManifest, uri string) {
 }
 
 // verifyHardBinding checks the manifest's hard-binding assertion, which proves
-// the asset content has not changed since signing. For JPEG/PNG this is
-// c2pa.hash.data (a SHA over the whole file minus declared exclusion ranges
+// the asset content has not changed since signing. For every container except
+// BMFF this is c2pa.hash.data (a SHA over the whole file minus declared exclusion ranges
 // that cover the manifest itself); for BMFF assets it is c2pa.hash.bmff.v2/.v3
 // (verified by verifyBMFFHash). A v1 c2pa.hash.bmff assertion is ignored per
 // spec §18.6.1; a BMFF binding on a non-BMFF asset cannot bind it; and

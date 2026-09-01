@@ -67,6 +67,12 @@ const (
 	// since the embedded file sits wherever the producer appended it; Validate's
 	// larger cap usually will not.
 	PDF Container = "pdf"
+	// RIFF reads the manifest from a top-level `C2PA` chunk in any RIFF asset:
+	// WebP, WAV, AVI. One constant covers all three — like BMFF, the carrier
+	// mechanics are identical and only the form type differs. An AVI over 1 GB
+	// spills into further RIFF/AVIX containers, but the store lives in the
+	// first.
+	RIFF Container = "riff"
 )
 
 // Attribution says what a manifest is a claim about. A container can carry a
@@ -158,6 +164,8 @@ func Read(ctx context.Context, container Container, r io.Reader) Info {
 		jumbf = pngJUMBF(ctx, data)
 	case BMFF:
 		jumbf = bmffJUMBF(ctx, data)
+	case RIFF:
+		jumbf = riffJUMBF(ctx, data)
 	case PDF:
 		var src pdfStoreSource
 		_, jumbf, src = pdfScan(ctx, data)

@@ -276,6 +276,8 @@ func extractJUMBF(ctx context.Context, container Container, data []byte) []byte 
 		return pngJUMBF(ctx, data)
 	case BMFF:
 		return bmffJUMBF(ctx, data)
+	case RIFF:
+		return riffJUMBF(ctx, data)
 	case PDF:
 		return pdfJUMBF(ctx, data)
 	default:

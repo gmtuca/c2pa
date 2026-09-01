@@ -100,6 +100,19 @@ func assembleAsset(container Container, store []byte) (asset []byte, exclStart, 
 		exclLen = len(asset) - exclStart
 		asset = append(asset, pngChunk("IDAT", []byte{0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01})...)
 		asset = append(asset, pngChunk("IEND", nil)...)
+	case RIFF:
+		// A WebP: RIFF/WEBP with the store in a top-level C2PA chunk. The
+		// exclusion covers the chunk body only, so its 8-byte header and
+		// declared size stay hashed.
+		body := []byte("WEBP")
+		body = append(body, riffChunk("VP8L", []byte{0x2f, 0x00, 0x00, 0x00, 0x00})...)
+		hdr := len("RIFF") + 4 // the store's offset is past RIFF+size, then form+chunks
+		exclStart = hdr + len(body) + 8
+		body = append(body, riffChunk(riffC2PAChunk, store)...)
+		exclLen = len(store)
+		asset = append(asset, "RIFF"...)
+		asset = binary.LittleEndian.AppendUint32(asset, uint32(len(body)))
+		asset = append(asset, body...)
 	case PDF:
 		// Catalog /AF → file specification → embedded file stream (spec §A.4).
 		// The exclusion covers exactly the stream payload, as Adobe's reference
@@ -220,4 +233,16 @@ func buildFramedAsset(t testing.TB, frame assetFraming, spec manifestSpec) []byt
 	hashWithExclusions(asset, h, []byteRange{{start: start, length: length}})
 	final, _, _ := assemble(start, length, h.Sum(nil))
 	return final
+}
+
+// riffChunk frames payload as a RIFF chunk: FourCC, little-endian size, body,
+// then a pad byte when the size is odd.
+func riffChunk(id string, payload []byte) []byte {
+	out := append([]byte(id), 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(out[4:8], uint32(len(payload)))
+	out = append(out, payload...)
+	if len(payload)%2 == 1 {
+		out = append(out, 0)
+	}
+	return out
 }
