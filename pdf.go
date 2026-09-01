@@ -535,10 +535,14 @@ func pdfUnescapeName(b []byte) string {
 }
 
 // pdfInt reads /key as a direct integer. An indirect reference (`/Length 9 0 R`)
-// is not resolved — it reports absent, and the callers all have a fallback.
+// reports absent rather than its object number, so a caller cannot read 9 as the
+// value; the callers all have a fallback for absent.
 func pdfInt(b []byte, key string) (int, bool) {
 	p := pdfFindName(b, key, 0)
 	if p < 0 {
+		return 0, false
+	}
+	if _, _, ok := pdfRefAt(b, p, len(b)); ok {
 		return 0, false
 	}
 	v, _, ok := pdfUint(b, pdfSkipSpace(b, p), len(b))
