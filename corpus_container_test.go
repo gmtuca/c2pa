@@ -2,6 +2,7 @@ package c2pa
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"testing"
 )
@@ -75,8 +76,11 @@ func pngCaBX(boxData []byte) []byte {
 	return append(pngChunk("caBX", boxData[:cut]), pngChunk("caBX", boxData[cut:])...)
 }
 
-// assembleAsset wraps a manifest store in a container and reports the byte range
-// the manifest occupies, which is what the data-hash exclusion must cover.
+// assetFraming wraps a manifest store in container bytes and reports the byte
+// range the manifest occupies, which is what the data-hash exclusion must cover.
+type assetFraming func(store []byte) (asset []byte, exclStart, exclLen int)
+
+// assembleAsset is the framing each container's positive cases use.
 func assembleAsset(container Container, store []byte) (asset []byte, exclStart, exclLen int) {
 	switch container {
 	case JPEG:
@@ -96,16 +100,79 @@ func assembleAsset(container Container, store []byte) (asset []byte, exclStart, 
 		exclLen = len(asset) - exclStart
 		asset = append(asset, pngChunk("IDAT", []byte{0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01})...)
 		asset = append(asset, pngChunk("IEND", nil)...)
+	case PDF:
+		// Catalog /AF → file specification → embedded file stream (spec §A.4).
+		// The exclusion covers exactly the stream payload, as Adobe's reference
+		// PDF does: the stream dictionary and its /Length stay hashed, so the
+		// store cannot be resized after signing.
+		asset = append(asset, "%PDF-1.7\n"...)
+		asset = append(asset, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>\nendobj\n"...)
+		asset = append(asset, "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"...)
+		asset = append(asset, "3 0 obj\n<< /Type /Filespec /F (c2pa.c2pa) /UF (c2pa.c2pa)"+
+			" /AFRelationship /C2PA_Manifest /EF << /F 4 0 R >> >>\nendobj\n"...)
+		asset = append(asset, fmt.Sprintf("4 0 obj\n<< /Type /EmbeddedFile"+
+			" /Subtype /application#2Fc2pa /Length %d >>\nstream\n", len(store))...)
+		exclStart = len(asset)
+		asset = append(asset, store...)
+		exclLen = len(asset) - exclStart
+		asset = append(asset, "\nendstream\nendobj\n"...)
+		asset = append(asset, "trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"...)
 	}
 	return asset, exclStart, exclLen
 }
 
-// buildAsset resolves the circular dependency between the exclusion offsets and
-// the manifest size (CBOR integers are variable-width, so writing the offsets
-// changes the size that determines them) by iterating to a fixpoint, then does
-// one final pass to write the real digest. The digest lives inside the excluded
-// range, so writing it cannot invalidate it.
+// pdfProducerFraming frames the store the way an observed producer's output
+// does: a catalog at generation 1 (`5 1 obj`, `/Root 5 1 R`), /Type /FileSpec
+// rather than /Filespec, a literal-string /Subtype, and the manifest added by an
+// incremental update. Without the chain no catalog is written at all, which is
+// what an object stream does to one, leaving the literal /Subtype on the stream
+// as the only marker: the markers are only consulted when nothing resolves.
+func pdfProducerFraming(chain bool) assetFraming {
+	return func(store []byte) (asset []byte, exclStart, exclLen int) {
+		asset = append(asset, "%PDF-1.7\n"...)
+		asset = append(asset, "7 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"...)
+		if chain {
+			asset = append(asset,
+				"5 1 obj\n<< /PageMode /UseNone /Pages 7 0 R /Type /Catalog >>\nendobj\n"...)
+		}
+		// /Prev names the base section's xref, an offset the store cannot move,
+		// so it stays length-stable across the exclusion fixpoint's passes.
+		prev := len(asset)
+		asset = append(asset, "trailer\n<< /Size 8 /Root 5 1 R >>\nstartxref\n0\n%%EOF\n"...)
+
+		asset = append(asset, fmt.Sprintf("9 0 obj\n<< /Length %d"+
+			" /F << /Subtype (application/c2pa) /Length %d >> >>\nstream\n", len(store), len(store))...)
+		exclStart = len(asset)
+		asset = append(asset, store...)
+		exclLen = len(asset) - exclStart
+		asset = append(asset, "\nendstream\nendobj\n"...)
+		if chain {
+			asset = append(asset, "10 0 obj\n<< /AFRelationship /C2PA_Manifest /Desc (Content Credentials)"+
+				" /F (Content Credentials) /EF << /F 9 0 R >> /Subtype (application/c2pa)"+
+				" /Type /FileSpec /UF (Content Credentials) >>\nendobj\n"...)
+			asset = append(asset, "5 1 obj\n<< /PageMode /UseNone /Pages 7 0 R /Type /Catalog /AF [10 0 R]"+
+				" /Names << /EmbeddedFiles << /Names [(Content Credentials) 10 0 R] >> >> >>\nendobj\n"...)
+		}
+		asset = append(asset, fmt.Sprintf("trailer\n<< /Size 11 /Root 5 1 R /Prev %d >>"+
+			"\nstartxref\n0\n%%%%EOF\n", prev)...)
+		return asset, exclStart, exclLen
+	}
+}
+
+// buildAsset builds a signed asset in the container's own framing.
 func buildAsset(t testing.TB, container Container, spec manifestSpec) []byte {
+	t.Helper()
+	return buildFramedAsset(t, func(store []byte) ([]byte, int, int) {
+		return assembleAsset(container, store)
+	}, spec)
+}
+
+// buildFramedAsset resolves the circular dependency between the exclusion
+// offsets and the manifest size (CBOR integers are variable-width, so writing
+// the offsets changes the size that determines them) by iterating to a fixpoint,
+// then does one final pass to write the real digest. The digest lives inside the
+// excluded range, so writing it cannot invalidate it.
+func buildFramedAsset(t testing.TB, frame assetFraming, spec manifestSpec) []byte {
 	t.Helper()
 	alg := spec.dataHashAlg
 	if alg == "" {
@@ -132,7 +199,7 @@ func buildAsset(t testing.TB, container Container, spec manifestSpec) []byte {
 			binding = append(binding, *spec.extraBinding)
 		}
 		withHash.assertions = append(binding, spec.assertions...)
-		return assembleAsset(container, storeBox(buildManifest(t, withHash)))
+		return frame(storeBox(buildManifest(t, withHash)))
 	}
 
 	start, length := 0, 0

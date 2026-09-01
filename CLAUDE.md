@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `github.com/richardwooding/c2pa` is a flat (single Go package, no subpackages) **pure-Go** library
-for C2PA / Content Credentials provenance manifests in JPEG, PNG, and BMFF (MP4/MOV/HEIC/HEIF/
-AVIF), with **two modes**:
+for C2PA / Content Credentials provenance manifests in JPEG, PNG, BMFF (MP4/MOV/HEIC/HEIF/
+AVIF) and PDF, with **two modes**:
 
 - **`Read(ctx, container, r) Info`** — the fast, *unverified* reader. Surfaces what a file CLAIMS
   (generator, title, signer CN, signing time, AI flag) like EXIF or an unverified `From:` header. It
@@ -16,15 +16,16 @@ AVIF), with **two modes**:
   hard-binding hashes, the RFC 3161 timestamp, revocation, and ingredients — reporting C2PA §15 status
   codes. Pure Go, no cgo.
 
-The package stays one `package c2pa` but is split across topic files (`validate.go`, `boxes.go`,
+The package stays one `package c2pa` but is split across topic files (`validate.go`, `pdf.go`, `boxes.go`,
 `cose_verify.go`, `chain.go`, `trust.go`, `hashbinding.go`, `timestamp.go`, `revocation.go`,
 `ingredient.go`, `statuscodes.go`) — flat *import surface*, not one file. Don't introduce subpackages;
 that would force exporting internal helpers.
 
 Public surface:
 
-- `Read` / `Info` — fields Present, ClaimGenerator, Title, Format, AIGenerated, SoftwareAgent,
-  SignedBy, SignedAt.
+- `Read` / `Info` — fields Present, Attribution, ClaimGenerator, Title, Format, AIGenerated,
+  SoftwareAgent, SignedBy, SignedAt. `Attribution` / `AttributionAsset` / `AttributionUnknown` say
+  whether the manifest is a claim about the asset or about something it carries.
 - `Validate` / `ValidationResult` / `StatusEntry` / `StatusCode` / `Severity` — the verifier and its
   result. `ValidateOption` (`WithSigningTrust`, `WithTimestampTrust`, `WithOnlineRevocation`,
   `WithClock`, `WithMaxIngredientDepth`, `WithMaxScan`, `WithHTTPClient`).
@@ -82,6 +83,27 @@ fuzz targets stay untouched.
 - **Everything is best-effort and must never panic.** Malformed/truncated/cancelled input returns
   zero values. The RFC 3161 ASN.1 descent (`rfc3161GenTime`) is deliberately defensive at every
   `asn1.Unmarshal` step. This contract is enforced by the fuzz targets — keep them green.
+- **`pdf.go` is a lexical object scanner, not a PDF parser.** The store is an embedded file whose
+  file specification carries `/AFRelationship /C2PA_Manifest`, referenced from the catalog's `/AF`
+  (spec §A.4.1/§A.4.2.1). The catalog and the specification can be compressed into an object
+  stream, so the scan inflates visible `/Type /ObjStm` streams and indexes what they hold. PDF
+  32000-1 §7.5.7 forbids a stream object inside an object stream but permits that file
+  specification dictionary, so **the store's bytes being visible does not make the store
+  identifiable** — do not reach for that argument, it is false, and the marker fallback is not a
+  substitute for the chain. The catalog is resolved the way a reader does, through the last
+  `startxref`: taking the last `/Root` in the file lets bytes appended after `%%EOF` redirect the
+  document. `/Length` is a hint, verified against `endstream` and never trusted; inflation is
+  capped by `maxPDFInflate`. **An object ends past its stream, not at the payload's first
+  `endobj`** — the store is arbitrary binary and can spell that keyword, which silently lost the
+  whole manifest; `pdfStreamEnd` resolves the extent from a direct `/Length`, and an indirect one
+  still falls back. Deliberately NOT implemented: merging the stores of every update section into
+  one (§A.4.2.1) — so when more than one store is present, `partialStores` downgrades an
+  unresolvable ingredient reference from `ingredient.manifest.mismatch` to informational, because
+  §A.4.2.1 permits references across sections and absence from the active store proves nothing.
+  Object-level manifests (§A.4.3) carry the same markers as document-level ones, so a store the
+  catalog does not associate is surfaced with **`Info.Attribution = AttributionUnknown`** rather
+  than dropped: an attachment carrying provenance is a finding, and silence leaves a triage caller
+  unable to see it. Never report the signer or generator of such a store as the asset's.
 - **`signedAt` lives in an RFC 3161 timestamp.** `sigTst` (1.x) and `sigTst2` (2.x), both COSE
   unprotected headers, hold `tstTokens[].val`, each a `TimeStampResp` → CMS `SignedData` →
   `TSTInfo.genTime`. The walk handles both a full `TimeStampResp` and a bare `ContentInfo`. **Read
@@ -154,8 +176,15 @@ for provenance + license). `TestActionsAreAI` synthesises CBOR assertions in-mem
 no public AI-positive fixture. `example_test.go` holds the runnable godoc `Example` — keep it passing,
 it doubles as documentation. The `Fuzz*` targets cover the read pipeline, the recursive box walker,
 the ASN.1 timestamp descent, the offset-aware `parseStore`/`parseBoxTree`, the full `Validate`
-pipeline, the CMS timestamp verifier, and the exclusion-range hashing; their seed corpora run as
-normal tests in CI.
+pipeline, the CMS timestamp verifier, the exclusion-range hashing, and the PDF object scan; their
+seed corpora run as normal tests in CI.
+
+**PDF tests build synthetic documents**, like the BMFF ones (`pdf_test.go`'s `pdfDoc` builder) —
+there is no public C2PA-signed PDF fixture with a redistributable licence. A fully valid PDF asset
+comes from the generated corpus instead (`assembleAsset`'s PDF case, in the positive matrix). Where
+`pdf_test.go` carries the JPEG fixture's own store in a PDF, the fixture's `c2pa.hash.data`
+legitimately mismatches — its exclusions describe the JPEG — so those tests assert on the signature
+step, not on `Valid`.
 
 **Validation tests are self-contained.** The fixture's signer chain (leaf + intermediate) is in its
 own COSE x5chain, so positive tests anchor a test pool at the fixture's own intermediate via
@@ -167,7 +196,8 @@ and by generating ephemeral certs in-test — no new binary fixtures.
 **There is also a generated corpus** (`corpus_gen_test.go`, `corpus_container_test.go`,
 `corpus_test.go`, `corpus_tsa_test.go`, `corpus_timestamp_test.go`, `corpus_fuzz_test.go`) that
 builds valid C2PA assets from scratch — JUMBF superbox/`jumd` writer, assertion store, 1.x and 2.x
-claims, COSE_Sign1, JPEG APP11 / PNG caBX framing, and a hand-rolled RFC 3161 / CMS token writer —
+claims, COSE_Sign1, JPEG APP11 / PNG caBX / PDF embedded-file framing, and a hand-rolled
+RFC 3161 / CMS token writer —
 then applies named mutations. It exists because five fixtures cannot express an expired certificate,
 an ES256 signature, or a timestamp that fails one specific way. Everything is built in memory;
 nothing lands in `testdata/`. Four things to know before extending it:

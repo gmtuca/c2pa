@@ -10,28 +10,30 @@ import (
 
 // corpusSeeds builds generated assets for the fuzz targets. The existing seeds
 // are the real fixtures plus hand-written byte literals; these add structurally
-// valid JPEG and PNG manifests the mutator can start from, so it explores box
-// trees that already parse instead of spending its budget rediscovering the
-// container framing.
+// valid JPEG, PNG and PDF manifests the mutator can start from, so it explores
+// box trees and object graphs that already parse instead of spending its budget
+// rediscovering the container framing.
 //
 // Seeds are built rather than committed, so nothing lands in testdata/.
-func corpusSeeds(t testing.TB) (jpeg, png, store []byte) {
+func corpusSeeds(t testing.TB) (jpeg, png, pdf, store []byte) {
 	t.Helper()
 	sb := newCorpusSigner(t, cose.AlgorithmES256)
 	spec := manifestSpec{signer: sb, assertions: []assertionSpec{markerAssertion()}}
 	jpeg = buildAsset(t, JPEG, spec)
 	png = buildAsset(t, PNG, spec)
+	pdf = buildAsset(t, PDF, spec)
 	store = storeBox(buildManifest(t, manifestSpec{signer: sb}))
-	return jpeg, png, store
+	return jpeg, png, pdf, store
 }
 
 func FuzzCorpusRead(f *testing.F) {
-	jpeg, png, store := corpusSeeds(f)
+	jpeg, png, pdf, store := corpusSeeds(f)
 	f.Add(jpeg)
 	f.Add(png)
+	f.Add(pdf)
 	f.Add(store)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		for _, c := range []Container{JPEG, PNG, BMFF} {
+		for _, c := range []Container{JPEG, PNG, BMFF, PDF} {
 			info := Read(t.Context(), c, bytes.NewReader(data))
 			if !info.Present && info.ClaimGenerator != "" {
 				t.Fatalf("absent manifest reported a generator %q", info.ClaimGenerator)
@@ -41,12 +43,13 @@ func FuzzCorpusRead(f *testing.F) {
 }
 
 func FuzzCorpusValidate(f *testing.F) {
-	jpeg, png, store := corpusSeeds(f)
+	jpeg, png, pdf, store := corpusSeeds(f)
 	f.Add(jpeg)
 	f.Add(png)
+	f.Add(pdf)
 	f.Add(store)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		for _, c := range []Container{JPEG, PNG, BMFF} {
+		for _, c := range []Container{JPEG, PNG, BMFF, PDF} {
 			res := Validate(t.Context(), c, bytes.NewReader(data), WithOnlineRevocation(false))
 			failures := 0
 			for _, s := range res.Statuses {

@@ -33,6 +33,7 @@ jobs:
           - FuzzVerifyTimestamp
           - FuzzBMFFParse
           - FuzzBMFFHash
+          - FuzzPDFParse
           - FuzzCorpusRead
           - FuzzCorpusValidate
           - FuzzCorpusTimestamp

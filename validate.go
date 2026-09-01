@@ -144,6 +144,13 @@ type validator struct {
 	data      []byte          // the full asset bytes read (up to cfg.maxScan)
 	res       ValidationResult
 	visited   map[string]bool // manifest labels already validated (ingredient cycle guard)
+	// attribution is what the container said the store is a claim about, kept
+	// until parseManifest has built the Info it belongs on.
+	attribution Attribution
+	// partialStores records that the carrier holds manifest stores this
+	// extractor did not parse, so a reference it cannot resolve is unproven
+	// rather than wrong.
+	partialStores bool
 }
 
 func (v *validator) add(code StatusCode, uri, explain string, err error) {
@@ -183,7 +190,10 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 	for _, o := range opts {
 		o(&cfg)
 	}
-	v := &validator{ctx: ctx, cfg: cfg, container: container, visited: map[string]bool{}}
+	v := &validator{
+		ctx: ctx, cfg: cfg, container: container,
+		visited: map[string]bool{}, attribution: AttributionAsset,
+	}
 
 	if ctx.Err() != nil {
 		v.add(StatusGeneralError, "", "context cancelled before validation", ctx.Err())
@@ -204,8 +214,14 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 	if container == BMFF && bmffHasUpdateManifest(ctx, data) {
 		v.add(StatusUnsupported, "", "BMFF update manifest present but not evaluated", nil)
 	}
+	if container == PDF && !v.checkPDFStores(ctx, data) {
+		return v.finish()
+	}
 	// Reuse the read path to surface the convenience Info fields.
 	v.res.Info = parseManifest(ctx, jumbf)
+	if v.res.Info.Present {
+		v.res.Info.Attribution = v.attribution
+	}
 
 	store := parseStore(ctx, jumbf)
 	m := store.active()
@@ -219,6 +235,38 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 	return v.finish()
 }
 
+// checkPDFStores records what the PDF container cannot settle by itself: a store
+// that only the §A.4.1 markers identified, which §A.4.3 allows to be an embedded
+// file's manifest rather than the document's, and further stores this extractor
+// does not evaluate — earlier update sections', which §A.4.2.1 asks a consumer
+// to process together with the active one.
+// It reports whether validation should go on: §15.5.2.2 makes multiple stores in
+// one update section invalid and asks a consumer to treat that as if no
+// manifests were located, which is a failure, not an advisory.
+func (v *validator) checkPDFStores(ctx context.Context, data []byte) bool {
+	objs, _, src := pdfScan(ctx, data)
+	if src == pdfStoreMarker {
+		v.attribution = AttributionUnknown
+	}
+	tally := pdfTallyStores(ctx, data, objs)
+	if tally.attributed && tally.perSection > 1 {
+		v.add(StatusClaimMissing, "", "§15.5.2.2: one update section associates "+
+			"multiple C2PA manifest stores, so none is located", nil)
+		return false
+	}
+	if src == pdfStoreMarker {
+		v.add(StatusUnsupported, "", "PDF manifest store identified by its C2PA markers alone, "+
+			"the document catalog associating none: it may govern an embedded file, not the "+
+			"document, and its signer is not the document's", nil)
+	}
+	if tally.total > 1 {
+		v.partialStores = true
+		v.add(StatusUnsupported, "",
+			"PDF carries additional C2PA manifest stores that were not evaluated", nil)
+	}
+	return true
+}
+
 // extractJUMBF dispatches to the container-specific JUMBF extractor.
 func extractJUMBF(ctx context.Context, container Container, data []byte) []byte {
 	switch container {
@@ -228,6 +276,8 @@ func extractJUMBF(ctx context.Context, container Container, data []byte) []byte 
 		return pngJUMBF(ctx, data)
 	case BMFF:
 		return bmffJUMBF(ctx, data)
+	case PDF:
+		return pdfJUMBF(ctx, data)
 	default:
 		return nil
 	}
