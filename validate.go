@@ -144,6 +144,10 @@ type validator struct {
 	data      []byte          // the full asset bytes read (up to cfg.maxScan)
 	res       ValidationResult
 	visited   map[string]bool // manifest labels already validated (ingredient cycle guard)
+	// partialStores records that the carrier holds manifest stores this
+	// extractor did not parse, so a reference it cannot resolve is unproven
+	// rather than wrong.
+	partialStores bool
 }
 
 func (v *validator) add(code StatusCode, uri, explain string, err error) {
@@ -243,6 +247,7 @@ func (v *validator) checkPDFStores(ctx context.Context, data []byte) bool {
 			"with no catalog associating it: it may govern an embedded file, not the document", nil)
 	}
 	if tally.total > 1 {
+		v.partialStores = true
 		v.add(StatusUnsupported, "",
 			"PDF carries additional C2PA manifest stores that were not evaluated", nil)
 	}

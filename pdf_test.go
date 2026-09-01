@@ -901,6 +901,63 @@ func TestValidatePDF_AttachmentIsNotASecondStore(t *testing.T) {
 	}
 }
 
+// pdfTwoSectionFraming puts a constant store in the base section and the signed
+// one in an incremental update, so the document carries a store this extractor
+// does not evaluate while the active manifest is still the signed one. The base
+// section's bytes never change, which keeps the exclusion fixpoint stable.
+func pdfTwoSectionFraming(store []byte) (asset []byte, exclStart, exclLen int) {
+	earlier := synthJUMB([]byte("an earlier update section's store"))
+	asset = append(asset, "%PDF-1.7\n"...)
+	asset = append(asset, "1 0 obj\n<< /Type /Catalog /AF [3 0 R] >>\nendobj\n"...)
+	asset = append(asset, "3 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest"+
+		" /EF << /F 4 0 R >> >>\nendobj\n"...)
+	asset = append(asset, fmt.Sprintf("4 0 obj\n<< /Type /EmbeddedFile /Length %d >>\nstream\n",
+		len(earlier))...)
+	asset = append(asset, earlier...)
+	asset = append(asset, "\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"...)
+
+	asset = append(asset, "1 0 obj\n<< /Type /Catalog /AF [5 0 R] >>\nendobj\n"...)
+	asset = append(asset, "5 0 obj\n<< /Type /Filespec /AFRelationship /C2PA_Manifest"+
+		" /EF << /F 6 0 R >> >>\nendobj\n"...)
+	asset = append(asset, fmt.Sprintf("6 0 obj\n<< /Type /EmbeddedFile /Length %d >>\nstream\n",
+		len(store))...)
+	exclStart = len(asset)
+	asset = append(asset, store...)
+	exclLen = len(asset) - exclStart
+	asset = append(asset, "\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"...)
+	return asset, exclStart, exclLen
+}
+
+// TestValidatePDF_CrossStoreIngredientIsNotAMismatch pins that an ingredient
+// naming a manifest in an update section this extractor did not evaluate is not
+// reported as a mismatch. §A.4.2.1 permits the reference and asks a consumer to
+// process every store as one; only the active store is parsed here, so an absent
+// manifest is unproven, not wrong.
+func TestValidatePDF_CrossStoreIngredientIsNotAMismatch(t *testing.T) {
+	sb := newCorpusSigner(t, cose.AlgorithmES256)
+	asset := buildFramedAsset(t, pdfTwoSectionFraming, manifestSpec{
+		signer: sb,
+		assertions: []assertionSpec{
+			markerAssertion(),
+			{label: "c2pa.ingredient", raw: ingredientAssertion(t, "urn:in-an-earlier-section").data},
+		},
+	})
+
+	ctx := context.Background()
+	tally := pdfTallyStores(ctx, asset, indexPDFObjects(ctx, asset))
+	if tally.total != 2 {
+		t.Fatalf("framing did not produce two stores: %+v", tally)
+	}
+
+	res := runCorpus(t, PDF, asset, sb)
+	if res.Has(StatusIngredientManifestMismatch) {
+		t.Errorf("cross-store ingredient reported as a mismatch: %v", codes(res))
+	}
+	if !res.Valid {
+		t.Errorf("expected valid, got %v", codes(res))
+	}
+}
+
 // TestValidatePDF_VerifiesSignature runs the full validator over a PDF carrying
 // the fixture's manifest. The hard binding legitimately mismatches — the
 // fixture's c2pa.hash.data exclusions describe the JPEG it was signed over, not

@@ -92,9 +92,15 @@ fuzz targets stay untouched.
   substitute for the chain. The catalog is resolved the way a reader does, through the last
   `startxref`: taking the last `/Root` in the file lets bytes appended after `%%EOF` redirect the
   document. `/Length` is a hint, verified against `endstream` and never trusted; inflation is
-  capped by `maxPDFInflate`. Deliberately NOT implemented: merging the stores of every update
-  section into one (§A.4.2.1). Object-level manifests (§A.4.3) are indistinguishable from
-  document-level ones in the fallback path, which is why a fallback-sourced store is reported.
+  capped by `maxPDFInflate`. **An object ends past its stream, not at the payload's first
+  `endobj`** — the store is arbitrary binary and can spell that keyword, which silently lost the
+  whole manifest; `pdfStreamEnd` resolves the extent from a direct `/Length`, and an indirect one
+  still falls back. Deliberately NOT implemented: merging the stores of every update section into
+  one (§A.4.2.1) — so when more than one store is present, `partialStores` downgrades an
+  unresolvable ingredient reference from `ingredient.manifest.mismatch` to informational, because
+  §A.4.2.1 permits references across sections and absence from the active store proves nothing.
+  Object-level manifests (§A.4.3) are indistinguishable from document-level ones in the fallback
+  path, which is why a fallback-sourced store is reported.
 - **`signedAt` lives in an RFC 3161 timestamp.** `sigTst` (1.x) and `sigTst2` (2.x), both COSE
   unprotected headers, hold `tstTokens[].val`, each a `TimeStampResp` → CMS `SignedData` →
   `TSTInfo.genTime`. The walk handles both a full `TimeStampResp` and a bare `ContentInfo`. **Read

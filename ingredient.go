@@ -27,6 +27,14 @@ func (v *validator) validateIngredients(m *parsedManifest, store *parsedStore, d
 		}
 		child := resolveManifest(ref, byLabel)
 		if child == nil {
+			// §A.4.2.1 lets a PDF's stores reference across update sections and
+			// asks a consumer to process them as one. Only the active store is
+			// parsed, so absence there proves nothing about the document.
+			if v.partialStores {
+				v.add(StatusUnsupported, a.label,
+					"ingredient references a manifest in a store that was not evaluated", nil)
+				continue
+			}
 			v.add(StatusIngredientManifestMismatch, a.label, "ingredient references a manifest not present in the store", nil)
 			continue
 		}
