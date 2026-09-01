@@ -204,8 +204,8 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 	if container == BMFF && bmffHasUpdateManifest(ctx, data) {
 		v.add(StatusUnsupported, "", "BMFF update manifest present but not evaluated", nil)
 	}
-	if container == PDF {
-		v.checkPDFStores(ctx, data)
+	if container == PDF && !v.checkPDFStores(ctx, data) {
+		return v.finish()
 	}
 	// Reuse the read path to surface the convenience Info fields.
 	v.res.Info = parseManifest(ctx, jumbf)
@@ -227,16 +227,26 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 // file's manifest rather than the document's, and further stores this extractor
 // does not evaluate — earlier update sections', which §A.4.2.1 asks a consumer
 // to process together with the active one.
-func (v *validator) checkPDFStores(ctx context.Context, data []byte) {
+// It reports whether validation should go on: §15.5.2.2 makes multiple stores in
+// one update section invalid and asks a consumer to treat that as if no
+// manifests were located, which is a failure, not an advisory.
+func (v *validator) checkPDFStores(ctx context.Context, data []byte) bool {
 	objs, _, src := pdfScan(ctx, data)
+	tally := pdfTallyStores(ctx, data, objs)
+	if tally.attributed && tally.perSection > 1 {
+		v.add(StatusClaimMissing, "", "§15.5.2.2: one update section associates "+
+			"multiple C2PA manifest stores, so none is located", nil)
+		return false
+	}
 	if src == pdfStoreMarker {
 		v.add(StatusUnsupported, "", "PDF manifest store identified by its C2PA markers alone, "+
 			"with no catalog associating it: it may govern an embedded file, not the document", nil)
 	}
-	if n := pdfStoreCount(ctx, objs); n > 1 {
+	if tally.total > 1 {
 		v.add(StatusUnsupported, "",
 			"PDF carries additional C2PA manifest stores that were not evaluated", nil)
 	}
+	return true
 }
 
 // extractJUMBF dispatches to the container-specific JUMBF extractor.

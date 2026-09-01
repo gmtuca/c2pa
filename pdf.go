@@ -342,14 +342,7 @@ func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) (store [
 	if catalog == nil {
 		return nil, false
 	}
-	refs := pdfRefs(catalog, "AF", maxPDFAssociatedFiles)
-	if len(refs) == 1 {
-		// /AF may be an indirect reference to the array rather than the array.
-		if b := objs.body(refs[0]); pdfPeek(b) == '[' {
-			refs = pdfRefList(b, maxPDFAssociatedFiles)
-		}
-	}
-	for _, ref := range refs {
+	for _, ref := range pdfAssociatedFiles(objs, catalog) {
 		if ctx.Err() != nil {
 			return nil, false
 		}
@@ -375,16 +368,22 @@ func pdfMarkedStore(ctx context.Context, objs *pdfObjects) []byte {
 	// which describes an embedded image or font rather than the document; the
 	// markers are the same and nothing distinguishes them here.
 	attempts := 0
-	for _, marker := range []struct{ key, want string }{
-		{"AFRelationship", pdfC2PARelationship},
-		{"Subtype", pdfC2PAMediaType},
+	for _, marker := range []struct {
+		key, want string
+		read      func([]byte, string) string
+	}{
+		// ISO 32000 defines /AFRelationship as a name, so a literal string is
+		// not a spelling of it. Only the C2PA /Subtype media type is written
+		// either way.
+		{"AFRelationship", pdfC2PARelationship, pdfName},
+		{"Subtype", pdfC2PAMediaType, pdfText},
 	} {
 		for i := len(objs.order) - 1; i >= 0 && attempts < maxPDFStoreAttempts; i-- {
 			if ctx.Err() != nil {
 				return nil
 			}
 			body := objs.order[i].body
-			if pdfText(pdfDict(body), marker.key) != marker.want {
+			if marker.read(pdfDict(body), marker.key) != marker.want {
 				continue
 			}
 			attempts++
@@ -396,28 +395,119 @@ func pdfMarkedStore(ctx context.Context, objs *pdfObjects) []byte {
 	return nil
 }
 
-// pdfStoreCount counts the distinct embedded-file streams that a C2PA file
-// specification points at. More than one means the document carries stores this
-// extractor does not evaluate: earlier update sections' stores, which
-// §A.4.2.1 asks a consumer to process together with the active one, or
-// object-level manifests (§A.4.3).
-func pdfStoreCount(ctx context.Context, objs *pdfObjects) int {
+// pdfStoreTally counts the manifest stores this document associates with itself.
+// perSection is the most any one update section's catalog associates, which is
+// what §15.5.2.2 makes invalid. attributed is false when no catalog associated
+// anything and the count came from the markers instead.
+type pdfStoreTally struct {
+	total      int
+	perSection int
+	attributed bool
+}
+
+// pdfTallyStores counts the distinct embedded-file streams the document's own
+// catalogs associate as C2PA, per update section. An object-level manifest
+// (§A.4.3) is associated from the object it describes rather than from a
+// catalog, so an attachment carrying one is not a store of this document.
+func pdfTallyStores(ctx context.Context, data []byte, objs *pdfObjects) pdfStoreTally {
 	if objs == nil {
-		return 0
+		return pdfStoreTally{}
 	}
-	seen := map[int]bool{}
-	for _, o := range objs.order {
+	bounds := pdfSectionBounds(data)
+	seen, perSection := map[int]bool{}, map[int]int{}
+	for i := range objs.order {
 		if ctx.Err() != nil {
-			return len(seen)
+			break
 		}
-		if pdfName(pdfDict(o.body), "AFRelationship") != pdfC2PARelationship {
+		catalog := pdfIfCatalog(objs.order[i].body)
+		if catalog == nil {
 			continue
 		}
-		if num, ok := pdfEmbeddedFileRef(o.body); ok {
-			seen[num] = true
+		section := pdfSectionOf(bounds, objs.order[i].hdr)
+		for _, ref := range pdfAssociatedFiles(objs, catalog) {
+			filespec := objs.body(ref)
+			if filespec == nil ||
+				pdfName(pdfDict(filespec), "AFRelationship") != pdfC2PARelationship {
+				continue
+			}
+			if num, ok := pdfEmbeddedFileRef(filespec); ok && !seen[num] {
+				seen[num] = true
+				perSection[section]++
+			}
 		}
 	}
+	if len(seen) == 0 {
+		return pdfStoreTally{total: pdfMarkedCount(ctx, objs)}
+	}
+	high := 0
+	for _, n := range perSection {
+		high = max(high, n)
+	}
+	return pdfStoreTally{total: len(seen), perSection: high, attributed: true}
+}
+
+// pdfMarkedCount counts the distinct stores the §A.4.1 markers point at, for a
+// document whose catalogs associate none — where the extractor is least sure of
+// itself and the count must not go silent.
+func pdfMarkedCount(ctx context.Context, objs *pdfObjects) int {
+	seen := map[int]bool{}
+	for i := range objs.order {
+		if ctx.Err() != nil {
+			break
+		}
+		body := objs.order[i].body
+		dict := pdfDict(body)
+		if pdfName(dict, "AFRelationship") != pdfC2PARelationship &&
+			pdfText(dict, "Subtype") != pdfC2PAMediaType {
+			continue
+		}
+		if num, ok := pdfEmbeddedFileRef(body); ok {
+			seen[num] = true
+			continue
+		}
+		seen[objs.order[i].num] = true
+	}
 	return len(seen)
+}
+
+// pdfSectionBounds returns where each update section ends. An incremental update
+// appends a whole section ending in %%EOF, which is the only revision boundary a
+// lexical scan can see.
+func pdfSectionBounds(data []byte) []int {
+	var out []int
+	for i := 0; i < len(data) && len(out) < maxPDFXrefHops; {
+		k := bytes.Index(data[i:], []byte("%%EOF"))
+		if k < 0 {
+			break
+		}
+		out = append(out, i+k)
+		i += k + len("%%EOF")
+	}
+	return out
+}
+
+// pdfSectionOf reports which update section a byte offset falls in. An object
+// recovered from an object stream has no offset of its own and counts as the
+// first section.
+func pdfSectionOf(bounds []int, off int) int {
+	for i, end := range bounds {
+		if off <= end {
+			return i
+		}
+	}
+	return len(bounds)
+}
+
+// pdfAssociatedFiles returns the object numbers in a catalog's /AF, stepping
+// through an indirect reference to the array.
+func pdfAssociatedFiles(objs *pdfObjects, catalog []byte) []int {
+	refs := pdfRefs(catalog, "AF", maxPDFAssociatedFiles)
+	if len(refs) == 1 {
+		if b := objs.body(refs[0]); pdfPeek(b) == '[' {
+			return pdfRefList(b, maxPDFAssociatedFiles)
+		}
+	}
+	return refs
 }
 
 // pdfEmbeddedStore resolves a file specification to its embedded-file stream

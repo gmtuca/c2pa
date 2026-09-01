@@ -726,8 +726,8 @@ func TestValidatePDF_ReportsUnevaluatedStores(t *testing.T) {
 	store := extractJUMBF(ctx, JPEG, data)
 
 	one := synthPDF(t, store, false)
-	if n := pdfStoreCount(ctx, indexPDFObjects(ctx, one)); n != 1 {
-		t.Fatalf("single-store document counted %d stores", n)
+	if got := pdfTallyStores(ctx, one, indexPDFObjects(ctx, one)); got.total != 1 {
+		t.Fatalf("single-store document counted %d stores", got.total)
 	}
 	two := newPDFDoc().
 		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
@@ -738,8 +738,11 @@ func TestValidatePDF_ReportsUnevaluatedStores(t *testing.T) {
 		obj(5, "<< /AFRelationship /C2PA_Manifest /EF << /F 6 0 R >> >>").
 		stream(6, pdfEmbeddedFileDict, store, "").
 		trailer(1).bytes()
-	if n := pdfStoreCount(ctx, indexPDFObjects(ctx, two)); n != 2 {
-		t.Fatalf("re-signed document counted %d stores, want 2", n)
+	// Two sections, one store each: §A.4.2.1's unmerged case, not §15.5.2.2's
+	// invalid one.
+	got := pdfTallyStores(ctx, two, indexPDFObjects(ctx, two))
+	if got.total != 2 || got.perSection != 1 {
+		t.Fatalf("re-signed document tallied %+v, want total 2 across one-store sections", got)
 	}
 
 	r := Validate(ctx, PDF, bytes.NewReader(two), WithSigningTrust(pool))
@@ -748,6 +751,90 @@ func TestValidatePDF_ReportsUnevaluatedStores(t *testing.T) {
 	}
 	if !r.Has(StatusClaimSignatureValidated) {
 		t.Errorf("active manifest's signature not validated: %+v", r.Statuses)
+	}
+}
+
+// TestValidatePDF_MultipleStoresInOneSection pins §15.5.2.2: multiple manifest
+// stores in a single update section "shall all be considered as invalid and the
+// validation should treat this as if no manifests were located". Recording that
+// informationally left Valid true and still surfaced one of them.
+func TestValidatePDF_MultipleStoresInOneSection(t *testing.T) {
+	pool, data := fixtureSigningPool(t)
+	ctx := context.Background()
+	store := extractJUMBF(ctx, JPEG, data)
+
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R 5 0 R] >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, store, "").
+		obj(5, "<< /Type /Filespec /AFRelationship /C2PA_Manifest /EF << /F 6 0 R >> >>").
+		stream(6, pdfEmbeddedFileDict, store, "").
+		xrefTrailer(1).bytes()
+
+	r := Validate(ctx, PDF, bytes.NewReader(doc), WithSigningTrust(pool))
+	if r.Valid {
+		t.Errorf("two stores in one update section validated: %v", codes(r))
+	}
+	if !r.Has(StatusClaimMissing) {
+		t.Errorf("expected %s, treating it as if no manifest were located: %v",
+			StatusClaimMissing, codes(r))
+	}
+	if r.Has(StatusClaimSignatureValidated) {
+		t.Errorf("a store was still surfaced and verified: %v", codes(r))
+	}
+}
+
+// TestValidatePDF_StoreCountSeesMarkedStores pins that the counter considers the
+// same candidates the extractor would. Counting only file specifications whose
+// /AFRelationship is C2PA_Manifest reported 0 for /Subtype-only stores, so the
+// signal went silent exactly where the extractor is least sure of itself.
+func TestValidatePDF_StoreCountSeesMarkedStores(t *testing.T) {
+	pool, data := fixtureSigningPool(t)
+	ctx := context.Background()
+	store := extractJUMBF(ctx, JPEG, data)
+
+	// No catalog is visible and neither stream carries a relationship, so
+	// /Subtype is all there is to go on — and there are two of them.
+	doc := newPDFDoc().
+		stream(4, pdfEmbeddedFileDict, store, "").
+		stream(6, pdfEmbeddedFileDict, store, "").
+		trailer(1).bytes()
+
+	r := Validate(ctx, PDF, bytes.NewReader(doc), WithSigningTrust(pool))
+	for _, s := range r.Statuses {
+		if s.Code == StatusUnsupported && strings.Contains(s.Explanation, "not evaluated") {
+			return
+		}
+	}
+	t.Errorf("two /Subtype-only stores reported none unevaluated: %+v", r.Statuses)
+}
+
+// TestValidatePDF_AttachmentIsNotASecondStore pins the symmetric case: an
+// embedded file carrying its own object-level manifest (§A.4.3) is associated
+// from the object it describes, not from a catalog, so it is not a second store
+// of this document and must not raise a status.
+func TestValidatePDF_AttachmentIsNotASecondStore(t *testing.T) {
+	pool, data := fixtureSigningPool(t)
+	ctx := context.Background()
+	store := extractJUMBF(ctx, JPEG, data)
+
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, store, "").
+		obj(7, "<< /Type /Filespec /F (image.jpg) /AFRelationship /C2PA_Manifest"+
+			" /EF << /F 8 0 R >> >>").
+		stream(8, pdfEmbeddedFileDict, store, "").
+		xrefTrailer(1).bytes()
+
+	r := Validate(ctx, PDF, bytes.NewReader(doc), WithSigningTrust(pool))
+	if !r.Has(StatusClaimSignatureValidated) {
+		t.Fatalf("the document's own store was not evaluated: %v", codes(r))
+	}
+	for _, s := range r.Statuses {
+		if s.Code == StatusUnsupported && strings.Contains(s.Explanation, "not evaluated") {
+			t.Errorf("an attachment's manifest counted as a second store: %q", s.Explanation)
+		}
 	}
 }
 
