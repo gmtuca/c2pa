@@ -73,6 +73,9 @@ const (
 	// spills into further RIFF/AVIX containers, but the store lives in the
 	// first.
 	RIFF Container = "riff"
+	// TIFF reads the manifest from IFD tag 0xCD41 in a TIFF or DNG file. DNG is
+	// TIFF, so one constant covers both. BigTIFF is not read.
+	TIFF Container = "tiff"
 )
 
 // Attribution says what a manifest is a claim about. A container can carry a
@@ -166,6 +169,8 @@ func Read(ctx context.Context, container Container, r io.Reader) Info {
 		jumbf = bmffJUMBF(ctx, data)
 	case RIFF:
 		jumbf = riffJUMBF(ctx, data)
+	case TIFF:
+		jumbf = tiffJUMBF(ctx, data)
 	case PDF:
 		var src pdfStoreSource
 		_, jumbf, src = pdfScan(ctx, data)

@@ -1,0 +1,183 @@
+package c2pa
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"testing"
+)
+
+// tiffDoc builds a classic TIFF with a single IFD holding one entry.
+type tiffDoc struct {
+	bigEndian bool
+	tag       uint16
+	fieldType uint16
+	payload   []byte
+	// nextIFD overrides the next-IFD offset, for building a circular chain.
+	nextIFD uint32
+	// declaredSize overrides the entry's value count, for forging a length.
+	declaredSize uint32
+	forceOffset  bool
+}
+
+func (d tiffDoc) build() []byte {
+	bo := binary.AppendByteOrder(binary.LittleEndian)
+	order := []byte{'I', 'I'}
+	if d.bigEndian {
+		bo, order = binary.BigEndian, []byte{'M', 'M'}
+	}
+	size := d.declaredSize
+	if size == 0 {
+		size = uint32(len(d.payload))
+	}
+
+	out := append([]byte{}, order...)
+	out = bo.AppendUint16(out, 42)
+	out = bo.AppendUint32(out, 8) // first IFD immediately after the header
+
+	const storeOffset = 8 + 2 + 12 + 4
+	out = bo.AppendUint16(out, 1)
+	out = bo.AppendUint16(out, d.tag)
+	out = bo.AppendUint16(out, d.fieldType)
+	out = bo.AppendUint32(out, size)
+	if len(d.payload) <= 4 && !d.forceOffset {
+		inline := append([]byte{}, d.payload...)
+		for len(inline) < 4 {
+			inline = append(inline, 0)
+		}
+		out = append(out, inline...)
+	} else {
+		out = bo.AppendUint32(out, storeOffset)
+	}
+	out = bo.AppendUint32(out, d.nextIFD)
+	return append(out, d.payload...)
+}
+
+func TestTIFFJUMBF_BothByteOrders(t *testing.T) {
+	store := []byte("\x00\x00\x00\x10jumbthe-store-here")
+	for _, be := range []bool{false, true} {
+		name := "little-endian"
+		if be {
+			name = "big-endian"
+		}
+		t.Run(name, func(t *testing.T) {
+			data := tiffDoc{bigEndian: be, tag: tiffC2PATag, fieldType: tiffUndefined, payload: store}.build()
+			if got := tiffJUMBF(context.Background(), data); !bytes.Equal(got, store) {
+				t.Errorf("got %q, want %q", got, store)
+			}
+		})
+	}
+}
+
+func TestTIFFJUMBF_InlineValue(t *testing.T) {
+	// A store of four bytes or fewer lives in the entry's value field rather
+	// than at an offset. Reading the field as an offset would return garbage.
+	store := []byte{1, 2, 3, 4}
+	data := tiffDoc{tag: tiffC2PATag, fieldType: tiffUndefined, payload: store}.build()
+	if got := tiffJUMBF(context.Background(), data); !bytes.Equal(got, store) {
+		t.Errorf("got % x, want % x", got, store)
+	}
+}
+
+func TestTIFFJUMBF_WrongTagOrType(t *testing.T) {
+	store := []byte("a manifest store, allegedly")
+	cases := []struct {
+		name      string
+		tag       uint16
+		fieldType uint16
+	}{
+		{"another tag", 0x0100, tiffUndefined},
+		{"right tag, wrong field type", tiffC2PATag, 2 /* ASCII */},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := tiffDoc{tag: tc.tag, fieldType: tc.fieldType, payload: store}.build()
+			if got := tiffJUMBF(context.Background(), data); got != nil {
+				t.Errorf("got %q, want nil", got)
+			}
+		})
+	}
+}
+
+func TestTIFFJUMBF_NotTIFF(t *testing.T) {
+	for _, in := range [][]byte{
+		nil,
+		[]byte("II"),
+		[]byte("\xff\xd8\xff\xe0 jpeg"),
+		{'I', 'I', 43, 0, 8, 0, 0, 0}, // BigTIFF: a different layout, deliberately unread
+		{'X', 'Y', 42, 0, 8, 0, 0, 0},
+	} {
+		if got := tiffJUMBF(context.Background(), in); got != nil {
+			t.Errorf("input % x: got %q, want nil", in, got)
+		}
+	}
+}
+
+// TestTIFFJUMBF_ForgedValueCount is the TIFF analogue of the RIFF forged-size
+// case: the entry claims far more payload than the file holds.
+func TestTIFFJUMBF_ForgedValueCount(t *testing.T) {
+	data := tiffDoc{
+		tag: tiffC2PATag, fieldType: tiffUndefined,
+		payload: []byte("small"), declaredSize: 0xFFFFFF00, forceOffset: true,
+	}.build()
+	if got := tiffJUMBF(context.Background(), data); got != nil {
+		t.Errorf("a forged value count must yield nil, got %d bytes", len(got))
+	}
+}
+
+// TestTIFFJUMBF_CircularIFDChainTerminates is the failure mode unique to TIFF:
+// a next-IFD offset may point backwards, so a naive walk never returns.
+func TestTIFFJUMBF_CircularIFDChainTerminates(t *testing.T) {
+	data := tiffDoc{tag: 0x0100, fieldType: tiffUndefined, payload: []byte("no store"), nextIFD: 8}.build()
+
+	done := make(chan []byte, 1)
+	go func() { done <- tiffJUMBF(context.Background(), data) }()
+	select {
+	case got := <-done:
+		if got != nil {
+			t.Errorf("got %q, want nil", got)
+		}
+	case <-t.Context().Done():
+		t.Fatal("tiffJUMBF did not terminate on a self-referential IFD chain")
+	}
+}
+
+func TestTIFFJUMBF_EveryTruncation(t *testing.T) {
+	store := []byte("\x00\x00\x00\x08jumbpayload")
+	full := tiffDoc{tag: tiffC2PATag, fieldType: tiffUndefined, payload: store}.build()
+
+	for n := range len(full) {
+		if got := tiffJUMBF(context.Background(), full[:n]); got != nil && !bytes.Equal(got, store) {
+			t.Fatalf("truncation at %d produced a store that is not the real one: %q", n, got)
+		}
+	}
+	if got := tiffJUMBF(context.Background(), full); !bytes.Equal(got, store) {
+		t.Fatalf("the untruncated file must still yield the store, got %q", got)
+	}
+}
+
+func TestTIFFJUMBF_CancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	data := tiffDoc{tag: tiffC2PATag, fieldType: tiffUndefined, payload: []byte("store")}.build()
+	if got := tiffJUMBF(ctx, data); got != nil {
+		t.Errorf("cancelled context must yield nil, got %q", got)
+	}
+}
+
+func FuzzTIFFParse(f *testing.F) {
+	f.Add(tiffDoc{tag: tiffC2PATag, fieldType: tiffUndefined, payload: []byte("\x00\x00\x00\x08jumb")}.build())
+	f.Add(tiffDoc{bigEndian: true, tag: tiffC2PATag, fieldType: tiffUndefined, payload: []byte("store")}.build())
+	f.Add(tiffDoc{tag: 0x0100, fieldType: 3, payload: []byte{1, 2}, nextIFD: 8}.build())
+	f.Add([]byte{'I', 'I', 42, 0, 0xff, 0xff, 0xff, 0xff})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		store := tiffJUMBF(context.Background(), data)
+		if store == nil {
+			return
+		}
+		if len(store) > len(data) {
+			t.Fatalf("returned %d bytes from a %d-byte input", len(store), len(data))
+		}
+	})
+}

@@ -39,7 +39,7 @@ func TestCorpusPositiveMatrix(t *testing.T) {
 	containers := []struct {
 		name string
 		c    Container
-	}{{"jpeg", JPEG}, {"png", PNG}, {"pdf", PDF}, {"riff", RIFF}}
+	}{{"jpeg", JPEG}, {"png", PNG}, {"pdf", PDF}, {"riff", RIFF}, {"tiff", TIFF}}
 	algs := []struct {
 		name string
 		alg  cose.Algorithm

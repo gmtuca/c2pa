@@ -113,6 +113,22 @@ func assembleAsset(container Container, store []byte) (asset []byte, exclStart, 
 		asset = append(asset, "RIFF"...)
 		asset = binary.LittleEndian.AppendUint32(asset, uint32(len(body)))
 		asset = append(asset, body...)
+	case TIFF:
+		// Little-endian classic TIFF: header, one IFD holding the C2PA tag, then
+		// the store. The exclusion covers the store bytes only, so the IFD entry
+		// that points at them stays hashed.
+		const hdr, ifd = 8, 8 + 2 + 12 + 4 // header, then count + one entry + next-IFD
+		asset = append(asset, 'I', 'I', 42, 0)
+		asset = binary.LittleEndian.AppendUint32(asset, hdr)
+		asset = binary.LittleEndian.AppendUint16(asset, 1) // one entry
+		asset = binary.LittleEndian.AppendUint16(asset, tiffC2PATag)
+		asset = binary.LittleEndian.AppendUint16(asset, tiffUndefined)
+		asset = binary.LittleEndian.AppendUint32(asset, uint32(len(store)))
+		asset = binary.LittleEndian.AppendUint32(asset, ifd)
+		asset = binary.LittleEndian.AppendUint32(asset, 0) // no next IFD
+		exclStart = ifd
+		asset = append(asset, store...)
+		exclLen = len(store)
 	case PDF:
 		// Catalog /AF → file specification → embedded file stream (spec §A.4).
 		// The exclusion covers exactly the stream payload, as Adobe's reference

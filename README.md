@@ -9,7 +9,7 @@
 
 A small, **pure-Go** (no cgo) library for [C2PA / Content Credentials](https://c2pa.org)
 provenance manifests embedded in **JPEG**, **PNG**, **BMFF** (MP4, MOV, HEIC, HEIF, AVIF),
-**RIFF** (WebP, WAV, AVI) and **PDF** files, with two modes:
+**RIFF** (WebP, WAV, AVI), **TIFF** (and DNG) and **PDF** files, with two modes:
 
 - **`Read`** — a fast, *unverified* reader. Surfaces what a file *claims* (creating tool, title,
   format, AI-generated flag, signer identity, signing time) like EXIF or an email `From:` header.
@@ -32,7 +32,7 @@ AI-generated assets") — not for trust decisions.
 f, _ := os.Open("photo.jpg")
 defer f.Close()
 
-info := c2pa.Read(context.Background(), c2pa.JPEG, f) // or c2pa.PNG / c2pa.BMFF / c2pa.RIFF / c2pa.PDF
+info := c2pa.Read(context.Background(), c2pa.JPEG, f) // or c2pa.PNG / c2pa.BMFF / c2pa.RIFF / c2pa.TIFF / c2pa.PDF
 if !info.Present {
     return // no Content Credentials embedded
 }
@@ -52,6 +52,10 @@ context — a cancelled call surrenders promptly mid-scan.
 
 For **RIFF** (WebP, WAV, AVI), the store is a top-level `C2PA` chunk inside the outer `RIFF`
 container; a chunk declaring more bytes than the file holds is refused rather than read past.
+
+For **TIFF** and **DNG**, the store is IFD tag `0xCD41` with field type UNDEFINED; every IFD in the
+chain is checked, and the chain is hop-capped because a next-IFD offset may point backwards.
+BigTIFF is not read.
 
 For **PDF**, the manifest store is the embedded file the document catalog associates with
 `/AFRelationship /C2PA_Manifest` (spec §A.4). The catalog is the one the last `startxref` names, so
