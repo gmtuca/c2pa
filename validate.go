@@ -144,6 +144,9 @@ type validator struct {
 	data      []byte          // the full asset bytes read (up to cfg.maxScan)
 	res       ValidationResult
 	visited   map[string]bool // manifest labels already validated (ingredient cycle guard)
+	// attribution is what the container said the store is a claim about, kept
+	// until parseManifest has built the Info it belongs on.
+	attribution Attribution
 	// partialStores records that the carrier holds manifest stores this
 	// extractor did not parse, so a reference it cannot resolve is unproven
 	// rather than wrong.
@@ -187,7 +190,10 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 	for _, o := range opts {
 		o(&cfg)
 	}
-	v := &validator{ctx: ctx, cfg: cfg, container: container, visited: map[string]bool{}}
+	v := &validator{
+		ctx: ctx, cfg: cfg, container: container,
+		visited: map[string]bool{}, attribution: AttributionAsset,
+	}
 
 	if ctx.Err() != nil {
 		v.add(StatusGeneralError, "", "context cancelled before validation", ctx.Err())
@@ -213,6 +219,9 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 	}
 	// Reuse the read path to surface the convenience Info fields.
 	v.res.Info = parseManifest(ctx, jumbf)
+	if v.res.Info.Present {
+		v.res.Info.Attribution = v.attribution
+	}
 
 	store := parseStore(ctx, jumbf)
 	m := store.active()
@@ -236,6 +245,9 @@ func Validate(ctx context.Context, container Container, r io.Reader, opts ...Val
 // manifests were located, which is a failure, not an advisory.
 func (v *validator) checkPDFStores(ctx context.Context, data []byte) bool {
 	objs, _, src := pdfScan(ctx, data)
+	if src == pdfStoreMarker {
+		v.attribution = AttributionUnknown
+	}
 	tally := pdfTallyStores(ctx, data, objs)
 	if tally.attributed && tally.perSection > 1 {
 		v.add(StatusClaimMissing, "", "§15.5.2.2: one update section associates "+
@@ -244,7 +256,8 @@ func (v *validator) checkPDFStores(ctx context.Context, data []byte) bool {
 	}
 	if src == pdfStoreMarker {
 		v.add(StatusUnsupported, "", "PDF manifest store identified by its C2PA markers alone, "+
-			"with no catalog associating it: it may govern an embedded file, not the document", nil)
+			"the document catalog associating none: it may govern an embedded file, not the "+
+			"document, and its signer is not the document's", nil)
 	}
 	if tally.total > 1 {
 		v.partialStores = true

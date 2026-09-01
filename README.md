@@ -54,13 +54,15 @@ For **PDF**, the manifest store is the embedded file the document catalog associ
 `/AFRelationship /C2PA_Manifest` (spec §A.4). The catalog is the one the last `startxref` names, so
 bytes appended after `%%EOF` cannot redirect the document; a catalog or file specification
 compressed into an object stream is recovered by inflating it, and a `/FlateDecode` stream is
-inflated under a bound. Where only the spec's markers are visible, the store found that way cannot
-be shown to be the document's rather than an attachment's, and `Validate` says so. Stores from
+inflated under a bound. Where the catalog associates no store, one the spec's markers find is still
+surfaced, with `Info.Attribution` set to `AttributionUnknown` — it may describe a file the document
+carries rather than the document — and `Validate` records the same thing as a status. Stores from
 earlier update sections are not merged into the active manifest as §A.4.2.1 asks.
 
 | `Info` field | Meaning |
 |---|---|
 | `Present` | a C2PA manifest was found and parsed |
+| `Attribution` | `AttributionAsset` when the asset's own structure associates the manifest; `AttributionUnknown` when only the C2PA markers identified it, so it may describe a file the asset carries (PDF §A.4.3) — **do not report its signer as the asset's** |
 | `ClaimGenerator` | the tool that created/edited the asset |
 | `Title` | claim `dc:title` |
 | `Format` | claim `dc:format` (declared media type) |

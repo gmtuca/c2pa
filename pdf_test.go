@@ -102,9 +102,9 @@ func TestPDFAdobeReferenceFile(t *testing.T) {
 		t.Fatal("no manifest read from the reference file")
 	}
 	t.Logf("generator=%q signer=%q", info.ClaimGenerator, info.SignedBy)
-	store, resolved := pdfActiveStore(ctx, data, indexPDFObjects(ctx, data))
-	if store == nil || !resolved {
-		t.Error("the catalog chain does not resolve, so the store is unattributed")
+	if info.Attribution != AttributionAsset {
+		t.Errorf("Attribution = %q, want %q: the catalog chain should attribute the store",
+			info.Attribution, AttributionAsset)
 	}
 }
 
@@ -363,15 +363,18 @@ func TestPDFJUMBF_IncrementalUpdate(t *testing.T) {
 	})
 	t.Run("association dropped by the update", func(t *testing.T) {
 		// §A.4.2.1 makes the catalog's /AF the active manifest, so a catalog
-		// that associates none leaves the document claiming no provenance. The
-		// superseded store is still in the bytes; reporting it as the active
-		// manifest would attribute to the document something it dropped.
+		// associating none leaves the document claiming no provenance. The
+		// superseded store is still in the bytes and still surfaced — as
+		// something the document does not vouch for, not as its manifest.
 		doc := base.clone().
 			obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [5 0 R] >>").
 			obj(5, "<< /Type /Filespec /F (notes.txt) /AFRelationship /Supplement >>").
 			trailer(1).bytes()
-		if got := pdfJUMBF(ctx, doc); got != nil {
-			t.Fatalf("got %q want no manifest: the current catalog associates none", got)
+		if got := pdfJUMBF(ctx, doc); !bytes.Equal(got, first) {
+			t.Fatalf("got %q want the superseded store", got)
+		}
+		if _, _, src := pdfScan(ctx, doc); src != pdfStoreMarker {
+			t.Fatal("the superseded store was attributed to the document")
 		}
 	})
 }
@@ -528,14 +531,12 @@ func TestPDFJUMBF_SentinelBytesInPayload(t *testing.T) {
 	}
 }
 
-// TestPDFJUMBF_AttachmentManifestIsNotTheDocument pins that the markers alone do
-// not attribute a store to the document. §A.4.3 gives an object-level manifest
-// the identical /AFRelationship, and §A.4.2.1 puts the document-level file
-// specification in the EmbeddedFiles name tree as well, so the catalog's /AF
-// reference is the only discriminator — and here it names something else.
-func TestPDFJUMBF_AttachmentManifestIsNotTheDocument(t *testing.T) {
-	store := synthJUMB([]byte("an attachment's manifest"))
-	doc := newPDFDoc().
+// pdfWithAttachmentManifest builds a document whose catalog associates a plain
+// attachment, while a second embedded file carries a C2PA manifest that nothing
+// in the catalog points at — what §A.4.3 describes, and what an attachment
+// carrying its own provenance looks like.
+func pdfWithAttachmentManifest(store []byte) []byte {
+	return newPDFDoc().
 		obj(1, "<< /Type /Catalog /Pages 2 0 R /AF [3 0 R] >>").
 		obj(2, "<< /Type /Pages /Kids [] /Count 0 >>").
 		obj(3, "<< /Type /Filespec /F (notes.txt) /AFRelationship /Supplement >>").
@@ -543,9 +544,63 @@ func TestPDFJUMBF_AttachmentManifestIsNotTheDocument(t *testing.T) {
 			" /EF << /F 8 0 R >> >>").
 		stream(8, pdfEmbeddedFileDict, store, "").
 		xrefTrailer(1).bytes()
-	if got := pdfJUMBF(context.Background(), doc); got != nil {
-		t.Fatalf("an attachment's manifest was reported as the document's: got %q", got)
+}
+
+// TestReadPDF_Attribution pins what a manifest is a claim about. §A.4.3 gives a
+// manifest describing an embedded file the identical /AFRelationship, and
+// §A.4.2.1 puts the document-level specification in the EmbeddedFiles name tree
+// as well, so the catalog's /AF reference is the only discriminator. Reporting
+// the store without saying which it was leaves a caller no way to tell.
+func TestReadPDF_Attribution(t *testing.T) {
+	ctx := context.Background()
+	fixture, err := os.ReadFile("testdata/c2pa_signed.jpg")
+	if err != nil {
+		t.Fatal(err)
 	}
+	store := extractJUMBF(ctx, JPEG, fixture)
+
+	t.Run("the catalog associates it", func(t *testing.T) {
+		got := Read(ctx, PDF, bytes.NewReader(synthPDF(t, store, false)))
+		if !got.Present {
+			t.Fatal("no manifest read")
+		}
+		if got.Attribution != AttributionAsset {
+			t.Errorf("Attribution = %q, want %q", got.Attribution, AttributionAsset)
+		}
+	})
+
+	t.Run("nothing associates it", func(t *testing.T) {
+		// Still surfaced: an attachment carrying a signed, generated file is a
+		// finding. What must not happen is reporting its signer as the
+		// document's, which only the attribution can prevent.
+		got := Read(ctx, PDF, bytes.NewReader(pdfWithAttachmentManifest(store)))
+		if !got.Present {
+			t.Fatal("an unattributed manifest was dropped, leaving no signal at all")
+		}
+		if got.Attribution != AttributionUnknown {
+			t.Errorf("Attribution = %q, want %q", got.Attribution, AttributionUnknown)
+		}
+		if got.SignedBy == "" {
+			t.Error("SignedBy is empty, so the caller cannot see whose manifest it is")
+		}
+	})
+
+	t.Run("a carrier with nowhere to hide one", func(t *testing.T) {
+		got := Read(ctx, JPEG, bytes.NewReader(fixture))
+		if !got.Present {
+			t.Fatal("fixture has no manifest")
+		}
+		if got.Attribution != AttributionAsset {
+			t.Errorf("Attribution = %q, want %q", got.Attribution, AttributionAsset)
+		}
+	})
+
+	t.Run("no manifest attributes nothing", func(t *testing.T) {
+		got := Read(ctx, PDF, bytes.NewReader([]byte("%PDF-1.7\nnothing here\n")))
+		if got.Present || got.Attribution != AttributionNone {
+			t.Errorf("got %+v, want a zero Info", got)
+		}
+	})
 }
 
 // TestValidatePDF_MarkerSourcedStoreIsReported pins that a store found by the
@@ -772,8 +827,8 @@ func TestValidatePDF_ProducerShapes(t *testing.T) {
 		if bytes.Contains(asset, []byte(pdfC2PARelationship)) {
 			t.Fatal("asset still carries the relationship marker")
 		}
-		if store, resolved := pdfActiveStore(ctx, asset, indexPDFObjects(ctx, asset)); store != nil || resolved {
-			t.Fatal("the catalog still resolves, so /Subtype is not the route")
+		if _, _, src := pdfScan(ctx, asset); src != pdfStoreMarker {
+			t.Fatal("the catalog still associates a store, so /Subtype is not the route")
 		}
 		assertPDFProducerValid(t, asset, sb)
 	})

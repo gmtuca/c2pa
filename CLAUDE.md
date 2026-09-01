@@ -23,8 +23,9 @@ that would force exporting internal helpers.
 
 Public surface:
 
-- `Read` / `Info` — fields Present, ClaimGenerator, Title, Format, AIGenerated, SoftwareAgent,
-  SignedBy, SignedAt.
+- `Read` / `Info` — fields Present, Attribution, ClaimGenerator, Title, Format, AIGenerated,
+  SoftwareAgent, SignedBy, SignedAt. `Attribution` / `AttributionAsset` / `AttributionUnknown` say
+  whether the manifest is a claim about the asset or about something it carries.
 - `Validate` / `ValidationResult` / `StatusEntry` / `StatusCode` / `Severity` — the verifier and its
   result. `ValidateOption` (`WithSigningTrust`, `WithTimestampTrust`, `WithOnlineRevocation`,
   `WithClock`, `WithMaxIngredientDepth`, `WithMaxScan`, `WithHTTPClient`).
@@ -99,8 +100,10 @@ fuzz targets stay untouched.
   one (§A.4.2.1) — so when more than one store is present, `partialStores` downgrades an
   unresolvable ingredient reference from `ingredient.manifest.mismatch` to informational, because
   §A.4.2.1 permits references across sections and absence from the active store proves nothing.
-  Object-level manifests (§A.4.3) are indistinguishable from document-level ones in the fallback
-  path, which is why a fallback-sourced store is reported.
+  Object-level manifests (§A.4.3) carry the same markers as document-level ones, so a store the
+  catalog does not associate is surfaced with **`Info.Attribution = AttributionUnknown`** rather
+  than dropped: an attachment carrying provenance is a finding, and silence leaves a triage caller
+  unable to see it. Never report the signer or generator of such a store as the asset's.
 - **`signedAt` lives in an RFC 3161 timestamp.** `sigTst` (1.x) and `sigTst2` (2.x), both COSE
   unprotected headers, hold `tstTokens[].val`, each a `TimeStampResp` → CMS `SignedData` →
   `TSTInfo.genTime`. The walk handles both a full `TimeStampResp` and a bare `ContentInfo`. **Read

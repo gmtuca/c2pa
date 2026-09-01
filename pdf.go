@@ -174,17 +174,15 @@ func pdfScan(ctx context.Context, data []byte) (*pdfObjects, []byte, pdfStoreSou
 		return objs, nil, pdfStoreNone
 	}
 	objs.indexObjectStreams(ctx)
-	store, resolved := pdfActiveStore(ctx, data, objs)
-	if store != nil {
+	if store := pdfActiveStore(ctx, data, objs); store != nil {
 		return objs, store, pdfStoreCatalog
 	}
-	if resolved {
-		// The catalog was readable and associated no C2PA file. Its /AF is the
-		// only thing that can attribute a store to the document, so scanning for
-		// markers here would report an attachment's manifest as the document's.
-		return objs, nil, pdfStoreNone
-	}
-	if store = pdfMarkedStore(ctx, objs); store != nil {
+	// Nothing the catalog associates. The markers may still find a store, but
+	// they cannot say it is the document's — §A.4.3 puts the same relationship on
+	// a manifest describing an embedded file. Reported as unattributed rather
+	// than dropped: an attachment carrying provenance is a finding, and silence
+	// leaves a caller unable to see it at all.
+	if store := pdfMarkedStore(ctx, objs); store != nil {
 		return objs, store, pdfStoreMarker
 	}
 	return objs, nil, pdfStoreNone
@@ -365,33 +363,32 @@ func pdfObjNumber(data []byte, pos int) (num, hdr int, ok bool) {
 // pdfActiveStore returns the active manifest by the route §A.4.2.1 defines: the
 // current trailer's /Root names the document catalog, whose /AF array lists the
 // associated files, and the one whose /AFRelationship is /C2PA_Manifest carries
-// the store in its /EF stream. resolved reports whether the catalog itself was
-// read, which is what separates "this document associates no manifest" from
-// "the pointer chain could not be followed".
-func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) (store []byte, resolved bool) {
+// the store in its /EF stream. Returns nil when that chain names no C2PA file,
+// which is the only thing that can attribute a store to the document.
+func pdfActiveStore(ctx context.Context, data []byte, objs *pdfObjects) []byte {
 	root, off, ok := pdfXrefRoot(ctx, data)
 	if !ok {
 		if root, ok = pdfRootLexical(ctx, data); !ok {
-			return nil, false
+			return nil
 		}
 	}
 	catalog := objs.catalog(root, off)
 	if catalog == nil {
-		return nil, false
+		return nil
 	}
 	for _, ref := range pdfAssociatedFiles(objs, catalog) {
 		if ctx.Err() != nil {
-			return nil, false
+			return nil
 		}
 		filespec := objs.body(ref)
 		if filespec == nil || pdfName(pdfDict(filespec), "AFRelationship") != pdfC2PARelationship {
 			continue
 		}
 		if store := pdfEmbeddedStore(ctx, objs, filespec); store != nil {
-			return store, true
+			return store
 		}
 	}
-	return nil, true
+	return nil
 }
 
 // pdfMarkedStore scans the visible objects, newest first, for a C2PA embedded

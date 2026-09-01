@@ -69,11 +69,34 @@ const (
 	PDF Container = "pdf"
 )
 
+// Attribution says what a manifest is a claim about. A container can carry a
+// manifest describing a file inside the asset rather than the asset itself, and
+// the C2PA markers on the two are identical, so only a reference from the
+// document's own structure separates them.
+type Attribution string
+
+const (
+	// AttributionNone is the zero value: no manifest, nothing to attribute.
+	AttributionNone Attribution = ""
+	// AttributionAsset means the asset's own structure associates the manifest,
+	// so it is a claim about the asset.
+	AttributionAsset Attribution = "asset"
+	// AttributionUnknown means the manifest was identified by its markers alone,
+	// with nothing associating it with the asset. It may describe a file the
+	// asset carries (PDF spec §A.4.3), or the reference may simply be
+	// unreadable. Do not report its signer or generator as the asset's.
+	AttributionUnknown Attribution = "unknown"
+)
+
 // Info is the surfaced, CLAIMED, UNVERIFIED subset of a C2PA manifest. See the
 // package doc: these are the file's assertions, not authenticated facts.
 type Info struct {
 	// Present is true when a C2PA manifest was found and parsed.
 	Present bool
+	// Attribution says whether the manifest is a claim about this asset. Only
+	// PDF can currently return AttributionUnknown; the other containers give a
+	// manifest no place to hide that the carrier does not point at.
+	Attribution Attribution
 	// ClaimGenerator is the tool that created/edited the asset (e.g.
 	// "Adobe Firefly", "make_test_images/0.33.1 c2pa-rs/0.33.1").
 	ClaimGenerator string
@@ -127,6 +150,7 @@ func Read(ctx context.Context, container Container, r io.Reader) Info {
 		return Info{}
 	}
 	var jumbf []byte
+	attribution := AttributionAsset
 	switch container {
 	case JPEG:
 		jumbf = jpegJUMBF(ctx, data)
@@ -135,14 +159,22 @@ func Read(ctx context.Context, container Container, r io.Reader) Info {
 	case BMFF:
 		jumbf = bmffJUMBF(ctx, data)
 	case PDF:
-		jumbf = pdfJUMBF(ctx, data)
+		var src pdfStoreSource
+		_, jumbf, src = pdfScan(ctx, data)
+		if src == pdfStoreMarker {
+			attribution = AttributionUnknown
+		}
 	default:
 		return Info{}
 	}
 	if len(jumbf) == 0 {
 		return Info{}
 	}
-	return parseManifest(ctx, jumbf)
+	info := parseManifest(ctx, jumbf)
+	if info.Present {
+		info.Attribution = attribution
+	}
+	return info
 }
 
 // jpegJUMBF reassembles the JUMBF box from APP11 (0xFFEB) marker segments,
