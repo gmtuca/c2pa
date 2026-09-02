@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"slices"
 	"strconv"
 )
 
@@ -121,8 +122,9 @@ func (l pdfXrefLoc) found() bool { return l.offset > 0 || l.stm > 0 }
 // a lookup that resolves an object number to its newest definition.
 type pdfObjects struct {
 	order   []pdfObject
-	newest  map[int]int // object number → index into order
-	inflate int         // decompression budget left for this extraction
+	newest  map[int]int   // object number → index into order
+	byNum   map[int][]int // object number → every index, built on demand
+	inflate int           // decompression budget left for this extraction
 }
 
 // body returns the newest visible definition of an object number, falling back
@@ -312,55 +314,106 @@ func (o *pdfObjects) repairIndirectLengths(ctx context.Context, data []byte) {
 		if len(refs) == 0 {
 			continue
 		}
-		n, ok := pdfIntBody(o.body(refs[0]))
-		if !ok {
-			continue
-		}
 		start := obj.start + rel
-		end := pdfStreamExtent(data, start, n)
+		end := o.resolveStreamExtent(data, refs[0], start)
 		if end <= 0 {
 			continue
 		}
 		obj.body = data[obj.start:pdfEndObj(data, end)]
 		payloads = append(payloads, pdfSpan{from: start, to: end})
 	}
-	o.dropIndexedWithin(payloads)
+	o.dropIndexedWithin(ctx, payloads)
+}
+
+// resolveStreamExtent reads the length object and returns where the payload
+// opening at start ends. Every definition of that number is tried, not just the
+// newest: a payload spelling the length object's own header shadows the real one
+// while its extent is unresolved, leaving the object unrepaired and the phantom
+// never dropped — each defeating the other. Landing on `endstream` is what makes
+// trying several safe.
+func (o *pdfObjects) resolveStreamExtent(data []byte, num, start int) int {
+	if n, ok := pdfIntBody(o.body(num)); ok {
+		if end := pdfStreamExtent(data, start, n); end > 0 {
+			return end
+		}
+	}
+	for _, i := range o.definitions(num) {
+		n, ok := pdfIntBody(o.order[i].body)
+		if !ok {
+			continue
+		}
+		if end := pdfStreamExtent(data, start, n); end > 0 {
+			return end
+		}
+	}
+	return 0
+}
+
+// definitions returns every index in order defining an object number, built once
+// and reused. Only reached when the newest definition did not resolve, so the
+// map is not built for a document that has no phantom to work around.
+func (o *pdfObjects) definitions(num int) []int {
+	if o.byNum == nil {
+		o.byNum = make(map[int][]int, len(o.order))
+		for i := range o.order {
+			o.byNum[o.order[i].num] = append(o.byNum[o.order[i].num], i)
+		}
+	}
+	return o.byNum[num]
 }
 
 // pdfSpan is a half-open byte range of the input.
 type pdfSpan struct{ from, to int }
 
-// dropIndexedWithin forgets the definitions that were indexed out of a stream
-// payload, now that the payload's real extent is known. While the extent was
-// unresolved the object ended at the payload's first `endobj` and the scan
-// carried on through the rest of it, so header-shaped bytes became entries; one
-// of them repeating the stream's own number shadows it in newest.
-func (o *pdfObjects) dropIndexedWithin(payloads []pdfSpan) {
-	if len(payloads) == 0 {
+// dropIndexedWithin forgets the definitions indexed out of a stream payload, now
+// that its real extent is known: while unresolved, the object ended at the
+// payload's first `endobj` and the scan carried on through the rest, so
+// header-shaped bytes became entries. Both order and the spans ascend by file
+// position, so one merged walk replaces a span scan per object — 200k indirect
+// streams is 200k spans. Cancelling abandons the prune, index untouched.
+func (o *pdfObjects) dropIndexedWithin(ctx context.Context, payloads []pdfSpan) {
+	if len(payloads) == 0 || ctx.Err() != nil {
 		return
 	}
-	kept := o.order[:0]
-	for _, ob := range o.order {
-		if pdfWithinAny(payloads, ob.hdr) {
+	merged := pdfMergeSpans(payloads)
+
+	kept, next := make([]pdfObject, 0, len(o.order)), 0
+	for i := range o.order {
+		if i%4096 == 0 && ctx.Err() != nil {
+			return
+		}
+		hdr := o.order[i].hdr
+		for next < len(merged) && merged[next].to <= hdr {
+			next++
+		}
+		if next < len(merged) && hdr >= merged[next].from {
 			continue
 		}
-		kept = append(kept, ob)
+		kept = append(kept, o.order[i])
 	}
 	o.order = kept
+	o.byNum = nil
 	o.newest = make(map[int]int, len(kept))
 	for i := range kept {
 		o.newest[kept[i].num] = i
 	}
 }
 
-// pdfWithinAny reports whether off falls inside any of the spans.
-func pdfWithinAny(spans []pdfSpan, off int) bool {
-	for _, s := range spans {
-		if off >= s.from && off < s.to {
-			return true
+// pdfMergeSpans sorts the spans and coalesces the ones that touch, so a single
+// cursor can walk them alongside the objects.
+func pdfMergeSpans(spans []pdfSpan) []pdfSpan {
+	slices.SortFunc(spans, func(a, b pdfSpan) int { return a.from - b.from })
+
+	merged := spans[:1]
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.from <= last.to {
+			last.to = max(last.to, s.to)
+			continue
 		}
+		merged = append(merged, s)
 	}
-	return false
+	return merged
 }
 
 // pdfIntBody reads the integer an object body holds on its own, which is what an
@@ -899,7 +952,10 @@ func pdfXrefRoot(
 			continue
 		}
 		candidate, at, placed := pdfXrefChain(ctx, data, objs, pos)
-		if placed {
+		// An in-use entry is not a resolution: the offset it carries has to land on the catalog it
+		// names. One placing /Root at offset 1 would otherwise take the document and leave the
+		// genuine earlier startxref untried.
+		if placed && objs.catalog(candidate, at, true) != nil {
 			return candidate, at, true
 		}
 		if candidate > 0 && named == 0 {

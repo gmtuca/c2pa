@@ -190,6 +190,17 @@ func (d *pdfDoc) appendUnplacedXref(root int) *pdfDoc {
 	return d
 }
 
+// appendMisplacedXref appends a section whose one in-use entry places root at an offset no object
+// sits at, plus a startxref naming it. An in-use entry exists, so anything checking only that the
+// section placed something accepts it.
+func (d *pdfDoc) appendMisplacedXref(root, offset int) *pdfDoc {
+	start := len(d.b)
+	d.b = append(d.b, fmt.Sprintf("xref\n0 1\n0000000000 65535 f \n%d 1\n%010d 00000 n \n"+
+		"trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%d\n%%%%EOF\n",
+		root, offset, root+1, root, start)...)
+	return d
+}
+
 // clone copies the document, so an update section can be appended to a fresh
 // copy without disturbing the bytes of the original.
 func (d *pdfDoc) clone() *pdfDoc {
@@ -450,6 +461,16 @@ func TestPDFJUMBF_AuthoritativeCatalog(t *testing.T) {
 			append(decoy).appendUnplacedXref(900).bytes()
 		if got := pdfJUMBF(ctx, tampered); !bytes.Equal(got, store) {
 			t.Fatalf("appended xref won: got %q want the genuine store", got)
+		}
+	})
+
+	t.Run("appended xref places a root at an offset nothing sits at", func(t *testing.T) {
+		// The entry is in use, so the section did place something; the offset resolves to no object.
+		// A candidate has to reach the catalog it names, not merely claim a location for it.
+		tampered := genuine.clone().
+			append(decoy).appendMisplacedXref(900, 1).bytes()
+		if got := pdfJUMBF(ctx, tampered); !bytes.Equal(got, store) {
+			t.Fatalf("misplaced xref won: got %q want the genuine store", got)
 		}
 	})
 
@@ -741,6 +762,30 @@ func TestPDFJUMBF_RepairDropsPhantomsFromThePayload(t *testing.T) {
 	}
 }
 
+// TestPDFJUMBF_PayloadPhantomCannotBlockItsOwnCleanup pins the deadlock between the two halves of
+// the repair. The length object is resolved before any phantom is dropped, so a payload spelling
+// that object's own header shadows the real definition: the length does not resolve, the object is
+// not re-cut, no payload extent is recorded, and the phantom is never dropped either.
+func TestPDFJUMBF_PayloadPhantomCannotBlockItsOwnCleanup(t *testing.T) {
+	store := synthJUMB([]byte("a title \n9 0 obj\n7\nendobj\n and more"))
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+		obj(3, pdfC2PAFilespec).
+		// The length object is written before the stream, which is what lets the payload's copy of
+		// its header win on the lexical "last definition of a number" rule.
+		obj(9, fmt.Sprint(len(store))).
+		stream(4, pdfEmbeddedFileDict, store, "9 0 R").
+		trailer(1).bytes()
+
+	_, got, src := pdfScan(context.Background(), doc)
+	if !bytes.Equal(got, store) {
+		t.Fatalf("got %d bytes, want %d", len(got), len(store))
+	}
+	if src != pdfStoreCatalog {
+		t.Fatalf("src = %v, want the catalog to still place the store", src)
+	}
+}
+
 // TestPDFJUMBF_IndirectLengthWithSentinelInPayload combines the two things the
 // scanner survives one at a time. An indirect /Length cannot be resolved on the
 // forward pass, so the object falls back to the first `endobj`; a store is
@@ -912,6 +957,27 @@ func TestPDFJUMBF_PathologicalCost(t *testing.T) {
 			bytes.Repeat([]byte("1 0 obj\n<< /Subtype /application#2Fc2pa /Length 99999 >>\nstream\n"), 50_000)...)
 		if got := pdfJUMBF(ctx, doc); got != nil {
 			t.Fatalf("yielded %d bytes", len(got))
+		}
+	})
+
+	// Every indirect-length stream resolves, so each contributes a payload extent to exclude from the
+	// index. Checking each extent against every object is quadratic, and this document fits well
+	// under Read's 16 MiB cap: 200k of them measured 13.5s that way against 583ms for one merged
+	// walk. The ceiling is calibrated on the merged walk under -race, which is what CI runs.
+	t.Run("many indirect-length streams", func(t *testing.T) {
+		var b bytes.Buffer
+		b.WriteString("%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n2 0 obj\n0\nendobj\n")
+		for i := 0; i < 200_000; i++ {
+			fmt.Fprintf(&b, "%d 0 obj\n<< /Length 2 0 R >>\nstream\n\nendstream\nendobj\n", 10+i)
+		}
+		b.WriteString("trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n")
+
+		start := time.Now()
+		if got := pdfJUMBF(ctx, b.Bytes()); got != nil {
+			t.Fatalf("yielded %d bytes", len(got))
+		}
+		if elapsed := time.Since(start); elapsed > 8*time.Second {
+			t.Fatalf("took %v, want the payload-extent walk to stay linear", elapsed)
 		}
 	})
 }
