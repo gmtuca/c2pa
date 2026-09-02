@@ -81,8 +81,8 @@ earlier update sections are not merged into the active manifest as §A.4.2.1 ask
 | `Format` | claim `dc:format` (declared media type) |
 | `AIGenerated` | a `c2pa.actions` `digitalSourceType` declares `trainedAlgorithmicMedia` / `compositeWithTrainedAlgorithmicMedia` |
 | `SoftwareAgent` | the tool the first `c2pa.actions` action names, as `name/version` (e.g. `gpt-image/2.0`) — the model or app, where `ClaimGenerator` is often the signing service |
-| `SignedBy` | COSE signer leaf-cert common name — **unverified** |
-| `SignedAt` | RFC 3161 signing time — **unverified** |
+| `SignedBy` | COSE signer leaf-cert common name — **unverified**; the proven counterpart is `ValidationResult.VerifiedSigner()` |
+| `SignedAt` | RFC 3161 signing time — **unverified**; the proven counterpart is `ValidationResult.SignedAt` |
 
 ## `Validate` — full cryptographic verification
 

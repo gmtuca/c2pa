@@ -32,6 +32,13 @@ Public surface:
 - `ExtractStore(ctx, container, r)` — the raw JUMBF store as embedded; nil means none found.
 - `WalkBoxes(ctx, jumbf, fn)` — lower-level JUMBF box-tree walker. Paired with ExtractStore
   this is what a manifest viewer uses to show assertions `Info` doesn't model.
+- `ValidationResult.VerifiedSigner()` — the signer's CN/Organization, but only when the ACTIVE
+  manifest's signature validated AND its chain reached a trust anchor; "" otherwise. `SignerChain`
+  is the chain as PRESENTED and is populated even when it fails to verify, so reading a name
+  straight off it is a claim, not a fact — the same trap `Info.SignedBy` carries. `SignedAt` and
+  `SignerChain` are guarded to `depth == 0`: `validateManifest` recurses into ingredients after
+  assigning them, so without the guard an ingredient's signer and timestamp overwrite the asset's
+  (c2pa_signed_video.mp4 reported "Bob" instead of "C2PA Signer").
 - `MaxScan` (Read's 16 MiB cap) / `ValidateMaxScan` (Validate's larger cap).
 
 ## Commands

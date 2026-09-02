@@ -49,6 +49,46 @@ type ValidationResult struct {
 	SignedAt time.Time
 }
 
+// VerifiedSigner returns the signer's identity — the leaf certificate's Subject
+// Common Name, falling back to its first Organization — but ONLY when that
+// identity was actually proven: the active manifest's claim signature verified,
+// and its certificate chain reached a trust anchor. Otherwise it returns "".
+//
+// Use this rather than reading SignerChain directly. SignerChain is the chain
+// as PRESENTED, populated whether or not it verified, so a name taken straight
+// from it is a claim rather than a fact — the same trap Info.SignedBy carries.
+//
+// A hard-binding failure does not clear it: if the content was edited after
+// signing, who signed the original is still proven, and Valid reports the edit.
+func (r ValidationResult) VerifiedSigner() string {
+	if !r.hasForActive(StatusClaimSignatureValidated) || !r.hasForActive(StatusSigningCredentialTrusted) {
+		return ""
+	}
+	if len(r.SignerChain) == 0 || r.SignerChain[0] == nil {
+		return ""
+	}
+	leaf := r.SignerChain[0]
+	if leaf.Subject.CommonName != "" {
+		return leaf.Subject.CommonName
+	}
+	if len(leaf.Subject.Organization) > 0 {
+		return leaf.Subject.Organization[0]
+	}
+	return ""
+}
+
+// hasForActive reports whether code was recorded against the active manifest
+// specifically. Plain Has would also match an ingredient's status, so a file
+// carrying a trusted ingredient could make an untrusted asset look verified.
+func (r ValidationResult) hasForActive(code StatusCode) bool {
+	for i := range r.Statuses {
+		if r.Statuses[i].Code == code && r.Statuses[i].URI == r.ActiveManifestLabel {
+			return true
+		}
+	}
+	return false
+}
+
 // Has reports whether any recorded status has the given code.
 func (r ValidationResult) Has(code StatusCode) bool {
 	for i := range r.Statuses {
@@ -140,8 +180,8 @@ func defaultConfig() validateConfig {
 type validator struct {
 	ctx       context.Context
 	cfg       validateConfig
-	container Container       // the carrier format Validate was called with
-	data      []byte          // the full asset bytes read (up to cfg.maxScan)
+	container Container // the carrier format Validate was called with
+	data      []byte    // the full asset bytes read (up to cfg.maxScan)
 	res       ValidationResult
 	visited   map[string]bool // manifest labels already validated (ingredient cycle guard)
 	// attribution is what the container said the store is a claim about, kept
@@ -315,12 +355,22 @@ func (v *validator) validateManifest(m *parsedManifest, store *parsedStore, dept
 	// still passes); otherwise fall back to the configured clock.
 	verifyTime := v.cfg.clock()
 	if genTime, trusted := v.verifyTimestamp(m, uri); trusted {
-		v.res.SignedAt = genTime
+		// Only the active manifest's timestamp describes THIS asset. An
+		// ingredient's is about the bytes that went into it, so letting the
+		// recursion below overwrite this would report an earlier work's
+		// signing time as the asset's.
+		if depth == 0 {
+			v.res.SignedAt = genTime
+		}
 		verifyTime = genTime
 	}
 
 	if len(chain) > 0 {
-		v.res.SignerChain = chain
+		// Likewise the signer: an ingredient is signed by whoever made the
+		// material, not by whoever signed this asset.
+		if depth == 0 {
+			v.res.SignerChain = chain
+		}
 		v.verifyChain(chain, v.signingTrustPool(), verifyTime, signingEKUOK, uri)
 		v.checkRevocation(chain, uri)
 	}
