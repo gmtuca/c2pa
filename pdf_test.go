@@ -1408,3 +1408,75 @@ func TestValidatePDF_VerifiesSignature(t *testing.T) {
 		t.Errorf("expected the fixture's data hash to mismatch in a PDF: %+v", r.Statuses)
 	}
 }
+
+// buildUnterminatedStreams produces n stream objects that each carry an
+// indirect /Length and never close with `endobj` — the shape that makes the
+// repair pass re-scan to end of file once per object.
+func buildUnterminatedStreams(n int) []byte {
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.7\n")
+	b.WriteString("1 0 obj\n5\nendobj\n")
+	for i := range n {
+		fmt.Fprintf(&b, "%d 0 obj\n<< /Length 1 0 R >>\nstream\nAAAAA\nendstream\n", i+10)
+	}
+	b.WriteString("trailer\n<< /Root 99 0 R >>\nstartxref\n0\n%%EOF\n")
+	return b.Bytes()
+}
+
+// TestPDFEndObjIsBounded pins the property directly, without depending on a
+// clock. pdfEndObj is called once per repaired object, so an unbounded search
+// costs a full pass over the input each time.
+func TestPDFEndObjIsBounded(t *testing.T) {
+	data := bytes.Repeat([]byte("A"), 4*maxPDFEndObjScan) // no `endobj` anywhere
+	if got := pdfEndObj(data, 0); got > maxPDFEndObjScan {
+		t.Errorf("pdfEndObj scanned to %d with no keyword present; must stop at %d", got, maxPDFEndObjScan)
+	}
+	// It must still find a keyword that is genuinely inside the window, which is
+	// where every conforming document puts it.
+	withKeyword := append(bytes.Repeat([]byte("A"), 100), "endobj"...)
+	if got := pdfEndObj(withKeyword, 0); got != 100 {
+		t.Errorf("pdfEndObj = %d, want 100 — the keyword is well inside the window", got)
+	}
+}
+
+// TestPDFRepairCostStaysLinear is the canary for the whole repair path, not just
+// pdfEndObj: any future full-input scan added per object shows up here.
+// Before the bound, 4k to 16k objects went from 108ms to 1.7s — 16x for 4x the
+// work. c2pa-inspector validates with context.Background(), so there is no
+// deadline to cut such a case short; the browser tab simply stops.
+// TestPDFRepairCostStaysLinear pins the bound on pdfEndObj. Resolving an
+// indirect /Length re-cuts the object, and finding its `endobj` by scanning to
+// end of file costs one full pass per repaired object. A document that omits
+// the keyword turns that into quadratic work: before the bound, quadrupling the
+// objects from 8k to 32k took 440ms to 6.9s, and a 16 MiB input ran for minutes.
+// c2pa-inspector validates with context.Background(), so there is no deadline
+// to cut it short — the browser tab simply stops.
+func TestPDFRepairCostStaysLinear(t *testing.T) {
+	const small, factor = 4000, 4
+
+	measure := func(n int) time.Duration {
+		data := buildUnterminatedStreams(n)
+		start := time.Now()
+		pdfJUMBF(context.Background(), data)
+		return time.Since(start)
+	}
+	// Best of three: a loaded machine inflates individual samples, and the
+	// minimum is the one least polluted by whatever else is running.
+	best := func(n int) time.Duration {
+		d := measure(n)
+		for range 2 {
+			d = min(d, measure(n))
+		}
+		return d
+	}
+	base, scaled := best(small), best(small*factor)
+
+	// Linear grows by `factor` (4x), quadratic by factor squared (16x). The
+	// midpoint separates them with headroom on both sides.
+	const tolerated = factor * 2
+	if scaled > base*tolerated {
+		t.Errorf("scaling %dx the objects took %.1fx the time (%v -> %v); the repair pass looks quadratic again",
+			factor, float64(scaled)/float64(max(base, time.Microsecond)), base, scaled)
+	}
+	t.Logf("%d objects %v; %d objects %v", small, base.Round(time.Millisecond), small*factor, scaled.Round(time.Millisecond))
+}

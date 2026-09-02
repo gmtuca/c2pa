@@ -87,6 +87,13 @@ const maxPDFXrefHops = 32
 // into N² attempts.
 const maxPDFLengthCandidates = 8
 
+// maxPDFEndObjScan bounds the search for the `endobj` closing a repaired stream
+// object. It sits just past an `endstream` the extent already verified, so a
+// few bytes of whitespace is the real distance. Scanning to end of file instead
+// made the repair pass quadratic: one full scan per repaired object, which a
+// document that simply omits the keyword turns into minutes of CPU.
+const maxPDFEndObjScan = 2048
+
 // maxPDFXrefStarts bounds how many startxref keywords are tried, newest first,
 // looking for one whose section places a /Root. A conforming document needs the
 // first; the rest are for one with junk appended after %%EOF.
@@ -433,13 +440,16 @@ func pdfIntBody(body []byte) (int, bool) {
 	return n, ok
 }
 
-// pdfEndObj returns where the `endobj` at or after from starts, or the end of
-// the input when there is none, matching how the forward pass bounds a body.
+// pdfEndObj returns where the `endobj` at or after from starts, searching a
+// bounded window. When the keyword is absent the window's end is returned: the
+// caller has already established the payload ends before from, so the body
+// still contains the whole stream.
 func pdfEndObj(data []byte, from int) int {
-	if e := bytes.Index(data[from:], []byte("endobj")); e >= 0 {
+	limit := min(from+maxPDFEndObjScan, len(data))
+	if e := bytes.Index(data[from:limit], []byte("endobj")); e >= 0 {
 		return from + e
 	}
-	return len(data)
+	return limit
 }
 
 // indexObjectStreams adds the objects held inside every visible /Type /ObjStm.
