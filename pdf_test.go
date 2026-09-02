@@ -180,6 +180,16 @@ func (d *pdfDoc) append(s string) *pdfDoc {
 	return d
 }
 
+// appendUnplacedXref appends a cross-reference section that parses and names its own /Root but
+// places no object at all, plus a startxref pointing at it. A decoy needs nothing more than this to
+// be the last section a reader looks at.
+func (d *pdfDoc) appendUnplacedXref(root int) *pdfDoc {
+	start := len(d.b)
+	d.b = append(d.b, fmt.Sprintf("xref\n0 1\n0000000000 65535 f \n"+
+		"trailer\n<< /Size 1 /Root %d 0 R >>\nstartxref\n%d\n%%%%EOF\n", root, start)...)
+	return d
+}
+
 // clone copies the document, so an update section can be appended to a fresh
 // copy without disturbing the bytes of the original.
 func (d *pdfDoc) clone() *pdfDoc {
@@ -432,6 +442,17 @@ func TestPDFJUMBF_AuthoritativeCatalog(t *testing.T) {
 		}
 	})
 
+	t.Run("appended xref names a root it does not place", func(t *testing.T) {
+		// The section parses and its trailer carries /Root, so taking a candidate on the presence of
+		// /Root alone accepts it. It places nothing, so the catalog never resolves and the genuine
+		// earlier startxref is never reached: a candidate has to place its root to count.
+		tampered := genuine.clone().
+			append(decoy).appendUnplacedXref(900).bytes()
+		if got := pdfJUMBF(ctx, tampered); !bytes.Equal(got, store) {
+			t.Fatalf("appended xref won: got %q want the genuine store", got)
+		}
+	})
+
 	t.Run("phantom catalog redefining the object", func(t *testing.T) {
 		// The decoy redefines object 1 rather than naming a new one, so it needs
 		// no /Root of its own: the lexical "last definition wins" rule hands it
@@ -666,6 +687,57 @@ func TestPDFJUMBF_SentinelBytesInPayload(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestPDFJUMBF_RepairStaysInsideTheObject pins that re-cutting cannot reach past the object being
+// re-cut. The keyword search runs forward from the body start, so a small dictionary sitting just
+// before a stream object can find that stream's `stream` keyword and its indirect /Length and be
+// re-cut through it — handing the document a store it does not associate as its own.
+func TestPDFJUMBF_RepairStaysInsideTheObject(t *testing.T) {
+	store := synthJUMB([]byte("an attachment's manifest"))
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+		// The embedded file the catalog's specification names does not exist, so the §A.4.2.1 chain
+		// resolves to nothing and no store is the document's.
+		obj(3, "<< /Type /Filespec /F (c2pa.c2pa) /UF (c2pa.c2pa) "+
+			"/AFRelationship /C2PA_Manifest /EF << /F 99 0 R >> >>").
+		stream(4, pdfEmbeddedFileDict, store, "9 0 R").
+		obj(9, fmt.Sprint(len(store))).
+		trailer(1).bytes()
+
+	_, got, src := pdfScan(context.Background(), doc)
+	if src == pdfStoreCatalog {
+		t.Fatalf("an unrelated stream was attributed to the document: %q", got)
+	}
+	// Still surfaced by the markers, which is right: it is a store the file carries.
+	if !bytes.Equal(got, store) || src != pdfStoreMarker {
+		t.Fatalf("src=%v got %d bytes, want the store by marker", src, len(got))
+	}
+}
+
+// TestPDFJUMBF_RepairDropsPhantomsFromThePayload pins that re-cutting an object also un-indexes what
+// was read out of its payload. Until the length resolves the object ends at the payload's first
+// `endobj`, so header-shaped bytes after that point are indexed as real objects; one of them naming
+// the stream's own number shadows it, and the store becomes unreachable.
+func TestPDFJUMBF_RepairDropsPhantomsFromThePayload(t *testing.T) {
+	store := synthJUMB([]byte("a title \n4 0 obj\njunk\nendobj\n and more"))
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, store, "9 0 R").
+		obj(9, fmt.Sprint(len(store))).
+		trailer(1).bytes()
+
+	// Asserted through the source, not just the bytes: the phantom breaks the §A.4.2.1 chain, and the
+	// markers then find the same store with nothing able to say it is the document's. Reporting the
+	// document's own manifest as unattributed is the whole distinction Attribution exists to carry.
+	_, got, src := pdfScan(context.Background(), doc)
+	if !bytes.Equal(got, store) {
+		t.Fatalf("got %d bytes, want %d", len(got), len(store))
+	}
+	if src != pdfStoreCatalog {
+		t.Fatalf("src = %v, want the catalog to still place the store", src)
 	}
 }
 

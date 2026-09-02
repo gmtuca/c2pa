@@ -290,19 +290,25 @@ func indexPDFObjects(ctx context.Context, data []byte) *pdfObjects {
 // binary that can spell one. Runs before any object stream is indexed, so every
 // entry here is a visible definition whose start addresses the asset bytes.
 func (o *pdfObjects) repairIndirectLengths(ctx context.Context, data []byte) {
+	var payloads []pdfSpan
+
 	for i := range o.order {
 		if ctx.Err() != nil {
 			return
 		}
 		obj := &o.order[i]
-		start, ok := pdfStreamKeyword(data, obj.start)
+		// Scoped to this object's own body, never to data: the keyword search reads maxPDFDictScan
+		// bytes ahead, so scanning the whole input lets a short dictionary find the NEXT object's
+		// `stream` and its /Length and be re-cut straight through it.
+		body := data[obj.start : obj.start+len(obj.body)]
+		rel, ok := pdfStreamKeyword(body, 0)
 		if !ok {
 			continue
 		}
 		// Only an indirect /Length is unfinished business: a direct one the
 		// forward pass either used or rejected as a lie, and re-deciding it here
 		// would undo that.
-		refs := pdfRefs(data[obj.start:start], "Length", 1)
+		refs := pdfRefs(body[:rel], "Length", 1)
 		if len(refs) == 0 {
 			continue
 		}
@@ -310,12 +316,51 @@ func (o *pdfObjects) repairIndirectLengths(ctx context.Context, data []byte) {
 		if !ok {
 			continue
 		}
+		start := obj.start + rel
 		end := pdfStreamExtent(data, start, n)
 		if end <= 0 {
 			continue
 		}
 		obj.body = data[obj.start:pdfEndObj(data, end)]
+		payloads = append(payloads, pdfSpan{from: start, to: end})
 	}
+	o.dropIndexedWithin(payloads)
+}
+
+// pdfSpan is a half-open byte range of the input.
+type pdfSpan struct{ from, to int }
+
+// dropIndexedWithin forgets the definitions that were indexed out of a stream
+// payload, now that the payload's real extent is known. While the extent was
+// unresolved the object ended at the payload's first `endobj` and the scan
+// carried on through the rest of it, so header-shaped bytes became entries; one
+// of them repeating the stream's own number shadows it in newest.
+func (o *pdfObjects) dropIndexedWithin(payloads []pdfSpan) {
+	if len(payloads) == 0 {
+		return
+	}
+	kept := o.order[:0]
+	for _, ob := range o.order {
+		if pdfWithinAny(payloads, ob.hdr) {
+			continue
+		}
+		kept = append(kept, ob)
+	}
+	o.order = kept
+	o.newest = make(map[int]int, len(kept))
+	for i := range kept {
+		o.newest[kept[i].num] = i
+	}
+}
+
+// pdfWithinAny reports whether off falls inside any of the spans.
+func pdfWithinAny(spans []pdfSpan, off int) bool {
+	for _, s := range spans {
+		if off >= s.from && off < s.to {
+			return true
+		}
+	}
+	return false
 }
 
 // pdfIntBody reads the integer an object body holds on its own, which is what an
@@ -842,7 +887,7 @@ func pdfXrefRoot(
 	data []byte,
 	objs *pdfObjects,
 ) (root int, loc pdfXrefLoc, ok bool) {
-	end := len(data)
+	end, named := len(data), 0
 	for tries := 0; tries < maxPDFXrefStarts; tries++ {
 		p := bytes.LastIndex(data[:end], []byte("startxref"))
 		if p < 0 {
@@ -853,24 +898,35 @@ func pdfXrefRoot(
 		if !spelled {
 			continue
 		}
-		if root, loc, ok = pdfXrefChain(ctx, data, objs, pos); ok {
-			return root, loc, true
+		candidate, at, placed := pdfXrefChain(ctx, data, objs, pos)
+		if placed {
+			return candidate, at, true
 		}
+		if candidate > 0 && named == 0 {
+			named = candidate
+		}
+	}
+	if named > 0 {
+		// Some section named a catalog and no section placed it. Reported as placed with nowhere to
+		// look, so the caller fails closed rather than falling back to lexical order, which is the
+		// thing an appended decoy exploits.
+		return named, pdfXrefLoc{}, true
 	}
 	return 0, pdfXrefLoc{}, false
 }
 
 // pdfXrefChain walks the /Prev chain from the section at pos and returns the
-// /Root it names. The whole chain is walked, not just the section naming /Root:
-// an object the newest update did not touch is placed by an older section.
-// Earlier sections never overwrite what a newer one already said, and each
-// candidate startxref gets its own placements so a decoy cannot seed them.
+// /Root it names, root being non-zero once some trailer named one and placed
+// reporting whether the chain also placed that object. The whole chain is
+// walked: an object the newest update did not touch is placed by an older
+// section. Earlier sections never overwrite what a newer one already said, and
+// each candidate startxref gets its own placements so a decoy cannot seed them.
 func pdfXrefChain(
 	ctx context.Context,
 	data []byte,
 	objs *pdfObjects,
 	pos int,
-) (root int, loc pdfXrefLoc, ok bool) {
+) (root int, loc pdfXrefLoc, placed bool) {
 	locs, found := map[int]pdfXrefLoc{}, false
 	for hop := 0; hop < maxPDFXrefHops; hop++ {
 		if ctx.Err() != nil || pos <= 0 || pos >= len(data) {
@@ -894,7 +950,10 @@ func pdfXrefChain(
 	if !found {
 		return 0, pdfXrefLoc{}, false
 	}
-	return root, locs[root], true
+	// A trailer naming /Root is not the same as a section placing it: an appended decoy needs only
+	// the name, so the placement is what earns this candidate the document.
+	loc = locs[root]
+	return root, loc, loc.found()
 }
 
 // pdfXrefSection returns the trailer dictionary of the cross-reference section
