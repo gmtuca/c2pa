@@ -81,6 +81,12 @@ const maxPDFStoreAttempts = 32
 // names /Root. Real documents name it in the newest trailer.
 const maxPDFXrefHops = 32
 
+// maxPDFLengthCandidates bounds how many definitions of one indirect /Length are
+// tried. A conforming document defines it once; a run of them is a payload
+// fabricating headers, and trying every one turns N streams naming N definitions
+// into N² attempts.
+const maxPDFLengthCandidates = 8
+
 // maxPDFXrefStarts bounds how many startxref keywords are tried, newest first,
 // looking for one whose section places a /Root. A conforming document needs the
 // first; the rest are for one with junk appended after %%EOF.
@@ -315,7 +321,7 @@ func (o *pdfObjects) repairIndirectLengths(ctx context.Context, data []byte) {
 			continue
 		}
 		start := obj.start + rel
-		end := o.resolveStreamExtent(data, refs[0], start)
+		end := o.resolveStreamExtent(ctx, data, refs[0], start)
 		if end <= 0 {
 			continue
 		}
@@ -326,32 +332,35 @@ func (o *pdfObjects) repairIndirectLengths(ctx context.Context, data []byte) {
 }
 
 // resolveStreamExtent reads the length object and returns where the payload
-// opening at start ends. Every definition of that number is tried, not just the
-// newest: a payload spelling the length object's own header shadows the real one
-// while its extent is unresolved, leaving the object unrepaired and the phantom
-// never dropped — each defeating the other. Landing on `endstream` is what makes
-// trying several safe.
-func (o *pdfObjects) resolveStreamExtent(data []byte, num, start int) int {
-	if n, ok := pdfIntBody(o.body(num)); ok {
-		if end := pdfStreamExtent(data, start, n); end > 0 {
-			return end
+// opening at start ends. Definitions are tried in file order rather than newest
+// first, because a payload can spell the length object's own header. Two things
+// make a candidate: landing on `endstream`, and its own header sitting outside
+// the extent it claims — a length object cannot live inside the payload it
+// measures, and a phantom that points past itself is exactly what does.
+func (o *pdfObjects) resolveStreamExtent(ctx context.Context, data []byte, num, start int) int {
+	for tried, i := range o.definitions(num) {
+		if tried >= maxPDFLengthCandidates || ctx.Err() != nil {
+			return 0
 		}
-	}
-	for _, i := range o.definitions(num) {
 		n, ok := pdfIntBody(o.order[i].body)
 		if !ok {
 			continue
 		}
-		if end := pdfStreamExtent(data, start, n); end > 0 {
-			return end
+		end := pdfStreamExtent(data, start, n)
+		if end <= 0 {
+			continue
 		}
+		if hdr := o.order[i].hdr; hdr >= start && hdr < end {
+			continue
+		}
+		return end
 	}
 	return 0
 }
 
 // definitions returns every index in order defining an object number, built once
-// and reused. Only reached when the newest definition did not resolve, so the
-// map is not built for a document that has no phantom to work around.
+// and reused: resolving each stream by walking the whole index instead would be
+// quadratic in a document that repeats one length object's number.
 func (o *pdfObjects) definitions(num int) []int {
 	if o.byNum == nil {
 		o.byNum = make(map[int][]int, len(o.order))

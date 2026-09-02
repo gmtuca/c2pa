@@ -786,6 +786,39 @@ func TestPDFJUMBF_PayloadPhantomCannotBlockItsOwnCleanup(t *testing.T) {
 	}
 }
 
+// TestPDFJUMBF_PayloadPhantomCannotTruncateTheStream pins that a fabricated length cannot cut the
+// object short. Trying several definitions needs more than "the value lands on `endstream`": a
+// payload can carry both a phantom length-object definition and an `endstream` for it to point at,
+// and being earlier in the file it is tried before the real definition. What gives it away is that
+// its own header sits inside the extent it claims, which no real length object can.
+func TestPDFJUMBF_PayloadPhantomCannotTruncateTheStream(t *testing.T) {
+	// The payload carries three things: a phantom definition of the length object, an `endstream` for
+	// its value to land on, and an `endobj` past that for the re-cut body to stop at. %%%% is
+	// replaced in place once the offset is known, so every offset stays put.
+	inner := append([]byte("\n9 0 obj\n%%%%\nendobj\n"), bytes.Repeat([]byte("A"), 60)...)
+	inner = append(inner, "endstream\nendobj\n"...)
+	inner = append(inner, bytes.Repeat([]byte("B"), 60)...)
+	store := synthJUMB(inner)
+
+	at := bytes.Index(store, []byte("endstream"))
+	if at < 0 || at > 9999 {
+		t.Fatalf("internal endstream at %d, unusable", at)
+	}
+	store = bytes.Replace(store, []byte("%%%%"), []byte(fmt.Sprintf("%04d", at)), 1)
+
+	doc := newPDFDoc().
+		obj(1, "<< /Type /Catalog /AF [3 0 R] >>").
+		obj(3, pdfC2PAFilespec).
+		stream(4, pdfEmbeddedFileDict, store, "9 0 R").
+		obj(9, fmt.Sprint(len(store))).
+		trailer(1).bytes()
+
+	got := pdfJUMBF(context.Background(), doc)
+	if !bytes.Equal(got, store) {
+		t.Fatalf("got %d bytes, want the whole %d-byte store", len(got), len(store))
+	}
+}
+
 // TestPDFJUMBF_IndirectLengthWithSentinelInPayload combines the two things the
 // scanner survives one at a time. An indirect /Length cannot be resolved on the
 // forward pass, so the object falls back to the first `endobj`; a store is
@@ -978,6 +1011,29 @@ func TestPDFJUMBF_PathologicalCost(t *testing.T) {
 		}
 		if elapsed := time.Since(start); elapsed > 8*time.Second {
 			t.Fatalf("took %v, want the payload-extent walk to stay linear", elapsed)
+		}
+	})
+
+	// Every stream names the same length object, and every definition of it is a fabrication that
+	// never parses. Trying them all is N attempts per stream and N² overall.
+	// maxPDFLengthCandidates is what bounds it: 0.39s under -race against 12.9s unbounded.
+	t.Run("one length object defined many times", func(t *testing.T) {
+		var b bytes.Buffer
+		b.WriteString("%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n")
+		for range 60_000 {
+			b.WriteString("2 0 obj\nnotanumber\nendobj\n")
+		}
+		for i := range 60_000 {
+			fmt.Fprintf(&b, "%d 0 obj\n<< /Length 2 0 R >>\nstream\n\nendstream\nendobj\n", 10+i)
+		}
+		b.WriteString("trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n")
+
+		start := time.Now()
+		if got := pdfJUMBF(ctx, b.Bytes()); got != nil {
+			t.Fatalf("yielded %d bytes", len(got))
+		}
+		if elapsed := time.Since(start); elapsed > 4*time.Second {
+			t.Fatalf("took %v, want the candidate search to stay bounded", elapsed)
 		}
 	})
 }
