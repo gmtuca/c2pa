@@ -423,7 +423,13 @@ empty for that whole generation of files.
   reaching the same manifest at depth > 0 would also call it unevaluated. The forbidden set is
   hard bindings, thumbnails, and any action outside `c2pa.edited.metadata` / `c2pa.opened` /
   `c2pa.published` / `c2pa.redacted` → `manifest.update.invalid`; zero or several parents →
-  `manifest.update.wrongParents`. **The four allowed actions are a deliberate divergence**:
+  `manifest.update.wrongParents`. **Every path that REJECTS an update manifest also records
+  `hardBinding.missing`** (`rejectUpdateManifest`): it returns before the parent's binding is
+  verified, so nothing hashed the asset, and reporting only the structural complaint left that
+  unsayable — two bytes flipping `c2ma` to `c2um` lift a genuinely signed manifest onto any file,
+  with the signature, chain and assertion hashes all still reporting success and
+  `assertion.dataHash.match` simply absent (`TestUpdateManifestRelabelCannotSilenceTheBinding`).
+  **The four allowed actions are a deliberate divergence**:
   c2pa-rs's own status-code doc describes ANY actions assertion in an update manifest as invalid,
   which would reject files §11.2.3 permits — the spec text is followed here.
 - **BMFF purpose decides which store is active** (§A.5.3). Ordinarily one box has purpose
